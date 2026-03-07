@@ -32,3 +32,6 @@ problems-report.html
 
 # Personal server config (startup commands, local package names)
 server/dexbgd.toml
+
+# Per-app session files (aliases, comments, hooks, bookmarks)
+server/sessions/

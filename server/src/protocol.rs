@@ -16,6 +16,8 @@ pub enum AgentMessage {
         #[serde(default)]
         api_level: Option<i32>,
         capabilities: Option<Capabilities>,
+        #[serde(default)]
+        package_name: Option<String>,
     },
 
     #[serde(rename = "cls_result")]

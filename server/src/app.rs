@@ -1,4 +1,4 @@
-use std::collections::{VecDeque, HashSet};
+use std::collections::{VecDeque, HashSet, HashMap};
 use std::net::TcpStream;
 use std::sync::mpsc;
 use std::time::Duration;
@@ -8,8 +8,8 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind, MouseButton};
 
 use crate::ai::{AiEvent, AiLineKind, AiMode, AiOutputLine, AiRequest, AiState};
-use crate::commands::{self, short_class, modifiers_str, short_type};
-use crate::condition::{self, BreakpointCondition};
+use crate::commands::{self, short_class, display_class, modifiers_str, short_type};
+use crate::condition::{self, BreakpointCondition, BreakpointAction, FORCE_RETURN_VOID};
 use crate::config::Config;
 use crate::connection;
 use crate::debugger::BreakpointManager;
@@ -463,6 +463,14 @@ pub struct App {
     pub pending_bypass_count: usize,
     /// True while bypass-ssl is active — enables SSLContext.init TrustManager inspection.
     pub bypass_ssl_active: bool,
+
+    // Per-app session state (loaded on connect, saved with Ctrl+S)
+    /// Package name of the connected app (from /proc/self/cmdline).
+    pub current_package: Option<String>,
+    /// User-defined display aliases: JNI class sig → label.
+    pub aliases: HashMap<String, String>,
+    /// App-specific intercept hooks (persisted in sessions/<pkg>.json).
+    pub hooks: Vec<crate::session::HookRule>,
     /// Breakpoints queued for restore after RedefineClasses cleared them.
     /// Each entry: (class, method, location, optional_condition).
     /// Consumed by the next matching BpSetOk to re-attach conditions.
@@ -519,6 +527,9 @@ pub struct App {
     // Comment dialog state
     pub comment_open: bool,
     pub comment_address: Option<u32>,
+    // Alias dialog state (n key — rename current class, IDA-style)
+    pub alias_open: bool,
+    pub alias_target: Option<String>, // JNI sig being renamed
     pub comment_input: String,
     pub comment_cursor: usize,
 }
@@ -634,6 +645,9 @@ impl App {
             bypass_ssl_bps: HashSet::new(),
             pending_bypass_count: 0,
             bypass_ssl_active: false,
+            current_package: None,
+            aliases: HashMap::new(),
+            hooks: Vec::new(),
             redefine_restore: Vec::new(),
             call_records: Vec::new(),
             recording_active: false,
@@ -677,6 +691,8 @@ impl App {
             comments: std::collections::HashMap::new(),
             comment_open: false,
             comment_address: None,
+            alias_open: false,
+            alias_target: None,
             comment_input: String::new(),
             comment_cursor: 0,
         }
@@ -793,7 +809,7 @@ impl App {
 
     fn handle_agent_message(&mut self, msg: AgentMessage) {
         match msg {
-            AgentMessage::Connected { pid, version, device, api_level, capabilities } => {
+            AgentMessage::Connected { pid, version, device, api_level, capabilities, package_name } => {
                 self.state = AppState::Connected;
                 let dev = device.as_deref().unwrap_or("unknown");
                 let api = api_level.map_or("?".to_string(), |v| v.to_string());
@@ -822,6 +838,11 @@ impl App {
                     self.cap_force_early_return = fer;
                     self.cap_pop_frame = pf;
                     self.cap_redefine_classes = caps.redefine_classes.unwrap_or(false);
+                }
+                // Load per-app session (aliases, comments, hooks, bookmarks)
+                if let Some(pkg) = package_name {
+                    self.current_package = Some(pkg.clone());
+                    self.load_session(&pkg);
                 }
                 // Auto-refresh thread list on connect
                 self.send_command(OutboundCommand::Threads {});
@@ -1066,6 +1087,27 @@ impl App {
                     self.send_command(OutboundCommand::SslGetTmClasses {});
                     return;
                 }
+                // Check for BreakpointAction (intercept hook — fires before condition eval)
+                if let Some(action) = self.bp_manager.get_condition(bp_id)
+                    .and_then(|c| c.action.clone())
+                {
+                    let cls = display_class(&class, &self.aliases);
+                    match action {
+                        BreakpointAction::LogAndContinue => {
+                            self.log_info(&format!("[hook] {}.{} @{}", cls, method, location));
+                            self.send_command(OutboundCommand::Continue {});
+                            return;
+                        }
+                        BreakpointAction::ForceReturn(v) => {
+                            let label = if v == FORCE_RETURN_VOID { "void".to_string() } else { v.to_string() };
+                            self.log_info(&format!("[hook] {}.{} force-return {}", cls, method, label));
+                            self.send_command(OutboundCommand::ForceReturn { return_value: if v == FORCE_RETURN_VOID { 0 } else { v } });
+                            self.send_command(OutboundCommand::Continue {});
+                            return;
+                        }
+                    }
+                }
+
                 // Check if this breakpoint has conditions
                 let has_condition = self.bp_manager.get_condition(bp_id).is_some();
                 if has_condition {
@@ -2167,6 +2209,17 @@ impl App {
                                     items.push("  Jump to PC  ".into());
                                 }
                             }
+                            // "Rename X" — class under cursor or current class
+                            {
+                                let sig = self.class_at_bc_idx(bc_idx)
+                                    .or_else(|| self.current_class.clone());
+                                if let Some(ref sig) = sig {
+                                    let name = crate::commands::short_class(sig);
+                                    let label = if name.len() > 16 { &name[..16] } else { name };
+                                    items.push("─────────────".into());
+                                    items.push(format!("  Rename {}", label));
+                                }
+                            }
                             self.context_menu = Some(ContextMenu {
                                 x: col,
                                 y: row,
@@ -2796,6 +2849,17 @@ impl App {
             "Return false" => self.execute_command("fr false"),
             "Patch method" => self.open_patch_submenu(),
             "Jump to PC"   => self.jump_to_pc(),
+            l if l.starts_with("Rename") => {
+                let sig = self.class_at_bc_idx(menu.line_idx)
+                    .or_else(|| self.current_class.clone());
+                if let Some(sig) = sig {
+                    let existing = self.aliases.get(&sig).cloned().unwrap_or_default();
+                    self.comment_input = existing;
+                    self.comment_cursor = self.comment_input.len();
+                    self.alias_target = Some(sig);
+                    self.alias_open = true;
+                }
+            }
             "Copy: class sig" => {
                 if let Some(cls) = &self.current_class.clone() {
                     copy_to_clipboard(cls);
@@ -3291,6 +3355,11 @@ impl App {
             self.handle_comment_key(key);
             return;
         }
+        // Alias dialog absorbs all keys
+        if self.alias_open {
+            self.handle_alias_key(key);
+            return;
+        }
 
         // Dismiss context menu on any key, or navigate if keyboard_navigable
         if self.context_menu.is_some() {
@@ -3336,6 +3405,9 @@ impl App {
             (KeyModifiers::CONTROL, KeyCode::Char('c')) => {
                 self.running = false;
                 return;
+            }
+            (KeyModifiers::CONTROL, KeyCode::Char('s')) => {
+                self.do_save_session();
             }
             (KeyModifiers::CONTROL, KeyCode::Char('t')) => {
                 self.theme_index = (self.theme_index + 1) % self.themes.len();
@@ -3616,6 +3688,76 @@ impl App {
         }
     }
 
+    /// Return the class sig of the invoke target at the bytecodes cursor, if any.
+    fn class_at_cursor(&self) -> Option<String> {
+        self.bytecodes_cursor.and_then(|i| self.class_at_bc_idx(i))
+    }
+
+    /// Return the class sig of the invoke target at a specific bytecodes index, if any.
+    fn class_at_bc_idx(&self, idx: usize) -> Option<String> {
+        let instr = self.bytecodes.get(idx)?;
+        let mid = instr.method_idx?;
+        let current_cls = self.current_class.as_deref().unwrap_or("");
+        // Try the DEX that owns the current class first, then all DEX
+        let dex_iter = self.find_dex_for_class(current_cls)
+            .into_iter()
+            .chain(self.dex_data.iter());
+        for dex in dex_iter {
+            if let Some(mref) = dex.methods.get(mid as usize) {
+                return Some(mref.class_name.clone());
+            }
+        }
+        None
+    }
+
+    fn handle_alias_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.alias_open = false;
+                self.alias_target = None;
+                self.comment_input.clear();
+                self.comment_cursor = 0;
+            }
+            KeyCode::Enter => {
+                if let Some(sig) = self.alias_target.take() {
+                    if self.comment_input.is_empty() {
+                        self.aliases.remove(&sig);
+                        let short = short_class(&sig);
+                        self.log_info(&format!("Alias removed: {}", short));
+                    } else {
+                        let label = self.comment_input.clone();
+                        self.aliases.insert(sig.clone(), label.clone());
+                        let short = short_class(&sig);
+                        self.log_info(&format!("Alias set: {} = {}  (Ctrl+S to save)", short, label));
+                    }
+                }
+                self.alias_open = false;
+                self.comment_input.clear();
+                self.comment_cursor = 0;
+            }
+            KeyCode::Backspace => {
+                if self.comment_cursor > 0 {
+                    self.comment_cursor -= 1;
+                    self.comment_input.remove(self.comment_cursor);
+                }
+            }
+            KeyCode::Delete => {
+                if self.comment_cursor < self.comment_input.len() {
+                    self.comment_input.remove(self.comment_cursor);
+                }
+            }
+            KeyCode::Left  => { if self.comment_cursor > 0 { self.comment_cursor -= 1; } }
+            KeyCode::Right => { if self.comment_cursor < self.comment_input.len() { self.comment_cursor += 1; } }
+            KeyCode::Home  => { self.comment_cursor = 0; }
+            KeyCode::End   => { self.comment_cursor = self.comment_input.len(); }
+            KeyCode::Char(c) if self.comment_input.len() < 64 => {
+                self.comment_input.insert(self.comment_cursor, c);
+                self.comment_cursor += c.len_utf8();
+            }
+            _ => {}
+        }
+    }
+
     fn handle_panel_key(&mut self, key: KeyEvent) {
         match key.code {
             // Quit
@@ -3662,6 +3804,22 @@ impl App {
                     && self.current_method.is_some() =>
             {
                 self.open_patch_submenu();
+            }
+            // n: rename name under cursor (IDA-style alias dialog)
+            KeyCode::Char('n')
+                if self.focus == 0
+                    && self.left_tab == LeftTab::Bytecodes
+                    && self.current_class.is_some() =>
+            {
+                // Prefer the invoke target class at cursor; fall back to current class
+                let sig = self.class_at_cursor()
+                    .or_else(|| self.current_class.clone())
+                    .unwrap();
+                let existing = self.aliases.get(&sig).cloned().unwrap_or_default();
+                self.comment_input = existing;
+                self.comment_cursor = self.comment_input.len();
+                self.alias_target = Some(sig);
+                self.alias_open = true;
             }
             // Focus command line on any letter (start typing)
             KeyCode::Char(c) if c.is_alphanumeric() => {
@@ -3935,11 +4093,135 @@ impl App {
             return;
         }
 
+        // Alias commands (pure server-side, no connection needed)
+        if input == "alias" {
+            self.log_info("usage: alias <class> <label>  |  alias list  |  alias clear <class|*>");
+            return;
+        }
+        if input == "alias list" || input == "aliases" {
+            if self.aliases.is_empty() {
+                self.log_info("No aliases defined.");
+            } else {
+                let mut lines: Vec<String> = self.aliases.iter()
+                    .map(|(k, v)| format!("  {} = {}", k, v))
+                    .collect();
+                lines.sort();
+                self.log_info(&format!("{} aliases:", lines.len()));
+                for line in lines {
+                    self.log_info(&line);
+                }
+            }
+            return;
+        }
+        if input.starts_with("alias clear ") {
+            let sig = input["alias clear ".len()..].trim();
+            if sig == "*" {
+                self.aliases.clear();
+                self.log_info("All aliases cleared.");
+            } else {
+                let jni = self.resolve_class(sig)
+                    .unwrap_or_else(|| commands::to_jni_sig(sig));
+                if self.aliases.remove(&jni).is_some() {
+                    self.log_info(&format!("Alias removed: {}", jni));
+                } else {
+                    self.log_error(&format!("No alias for: {}", jni));
+                }
+            }
+            return;
+        }
+        if input.starts_with("alias ") {
+            let rest = input["alias ".len()..].trim();
+            let parts: Vec<&str> = rest.splitn(2, ' ').collect();
+            if parts.len() < 2 || parts[1].trim().is_empty() {
+                self.log_error("usage: alias <class> <label>  e.g. alias MainActivity CertPinner");
+            } else {
+                let raw = parts[0].trim();
+                let sig = self.resolve_class(raw)
+                    .unwrap_or_else(|| commands::to_jni_sig(raw));
+                let label = parts[1].trim().to_string();
+                self.aliases.insert(sig.clone(), label.clone());
+                self.log_info(&format!("Alias set: {} = {}  (Ctrl+S to save)", sig, label));
+            }
+            return;
+        }
+
+        // Hook commands (app-specific intercept rules)
+        if input == "hook list" || input == "hooks" {
+            if self.hooks.is_empty() {
+                self.log_info("No app-specific hooks defined.");
+            } else {
+                let lines: Vec<String> = self.hooks.iter()
+                    .map(|h| format!("  {} {} -> {}", h.class, h.method, h.action))
+                    .collect();
+                self.log_info(&format!("{} hooks:", lines.len()));
+                for line in lines {
+                    self.log_info(&line);
+                }
+            }
+            return;
+        }
+        if input.starts_with("hook clear ") {
+            let rest = input["hook clear ".len()..].trim();
+            if rest == "*" {
+                self.hooks.clear();
+                self.log_info("All hooks cleared.");
+            } else {
+                let parts: Vec<&str> = rest.splitn(2, ' ').collect();
+                if parts.len() < 2 {
+                    self.log_error("usage: hook clear <class> <method>");
+                } else {
+                    let cls = commands::to_jni_sig(parts[0].trim());
+                    let meth = parts[1].trim();
+                    let before = self.hooks.len();
+                    self.hooks.retain(|h| !(h.class == cls && h.method == meth));
+                    if self.hooks.len() < before {
+                        self.log_info(&format!("Hook removed: {} {}", cls, meth));
+                    } else {
+                        self.log_error(&format!("No hook for: {} {}", cls, meth));
+                    }
+                }
+            }
+            return;
+        }
+        if input.starts_with("hook ") {
+            let rest = input["hook ".len()..].trim();
+            let parts: Vec<&str> = rest.splitn(3, ' ').collect();
+            if parts.len() < 3 {
+                self.log_error("usage: hook <class> <method> <action>");
+                self.log_error(&format!("  actions: {}", crate::session::VALID_ACTIONS.join(", ")));
+            } else {
+                let cls = commands::to_jni_sig(parts[0].trim());
+                let meth = parts[1].trim().to_string();
+                let act = parts[2].trim().to_string();
+                if !crate::session::VALID_ACTIONS.contains(&act.as_str()) {
+                    self.log_error(&format!("Unknown action '{}'. Use: {}", act, crate::session::VALID_ACTIONS.join(", ")));
+                    return;
+                }
+                if let Some(existing) = self.hooks.iter_mut().find(|h| h.class == cls && h.method == meth) {
+                    existing.action = act.clone();
+                    self.log_info(&format!("Hook updated: {} {} -> {}  (Ctrl+S to save)", cls, meth, act));
+                } else {
+                    self.hooks.push(crate::session::HookRule { class: cls.clone(), method: meth.clone(), action: act.clone() });
+                    self.log_info(&format!("Hook added: {} {} -> {}  (Ctrl+S to save)", cls, meth, act));
+                    if self.state != AppState::Disconnected {
+                        if let Some(bp_action) = condition::parse_action(&act) {
+                            self.pending_bp_conditions.push_back(BreakpointCondition::for_action(bp_action));
+                        }
+                        self.send_command(OutboundCommand::BpSet {
+                            class: cls,
+                            method: meth,
+                            sig: None,
+                            location: None,
+                        });
+                    }
+                }
+            }
+            return;
+        }
+
         if input.starts_with("launch ") {
-            let rest = input.splitn(2, ' ').nth(1).unwrap_or("").trim();
-            let wait = rest.starts_with("-w ");
-            let pkg = if wait { rest.splitn(2, ' ').nth(1).unwrap_or("").trim() } else { rest };
-            self.do_launch(pkg, wait);
+            let pkg = input.splitn(2, ' ').nth(1).unwrap_or("").trim();
+            self.do_launch(pkg);
             return;
         }
 
@@ -4611,6 +4893,85 @@ impl App {
         }
     }
 
+    fn do_save_session(&mut self) {
+        let pkg = match self.current_package.clone() {
+            Some(p) => p,
+            None => {
+                if self.state == AppState::Disconnected {
+                    self.log_info("Not connected.");
+                } else {
+                    self.log_info("Package name not available -- rebuild agent to enable sessions.");
+                }
+                return;
+            }
+        };
+        let session = crate::session::Session {
+            aliases: self.aliases.clone(),
+            comments: self.comments.iter().map(|((cls, meth, bci), val)| {
+                (format!("{} {} {}", cls, meth, bci), val.clone())
+            }).collect(),
+            hooks: self.hooks.clone(),
+            bookmarks: self.bookmarks.iter().map(|bm| crate::session::SessionBookmark {
+                class: bm.class.clone(),
+                method: bm.method.clone(),
+                offset: bm.offset,
+                label: bm.label.clone(),
+            }).collect(),
+        };
+        match session.save(&pkg) {
+            Ok(path) => self.log_info(&format!("Session saved: {}", path.display())),
+            Err(e)   => self.log_error(&format!("Session save failed: {}", e)),
+        }
+    }
+
+    fn load_session(&mut self, pkg: &str) {
+        let session = match crate::session::Session::load(pkg) {
+            Some(s) => s,
+            None => return,
+        };
+        let ac = session.aliases.len();
+        let cc = session.comments.len();
+        let hc = session.hooks.len();
+        let bc = session.bookmarks.len();
+
+        self.aliases = session.aliases;
+        for (key, val) in session.comments {
+            let parts: Vec<&str> = key.splitn(3, ' ').collect();
+            if parts.len() == 3 {
+                if let Ok(bci) = parts[2].parse::<u32>() {
+                    self.comments.insert((parts[0].to_string(), parts[1].to_string(), bci), val);
+                }
+            }
+        }
+        self.bookmarks = session.bookmarks.iter().map(|b| Bookmark {
+            class: b.class.clone(),
+            method: b.method.clone(),
+            offset: b.offset,
+            label: b.label.clone(),
+        }).collect();
+        self.hooks = session.hooks.clone();
+
+        // Re-apply hooks as breakpoints with actions
+        for hook in &session.hooks {
+            if let Some(action) = condition::parse_action(&hook.action) {
+                self.pending_bp_conditions.push_back(BreakpointCondition::for_action(action));
+                self.send_command(OutboundCommand::BpSet {
+                    class: hook.class.clone(),
+                    method: hook.method.clone(),
+                    sig: None,
+                    location: None,
+                });
+            }
+        }
+
+        if ac + cc + hc + bc > 0 {
+            self.log_info(&format!(
+                "Session loaded: {} aliases, {} comments, {} hooks, {} bookmarks",
+                ac, cc, hc, bc
+            ));
+        }
+    }
+
     fn do_save_settings(&mut self) {
         match self.config.write_ini(
             self.theme_index,
@@ -4867,20 +5228,12 @@ impl App {
         self.do_load_apk(pkg);
     }
 
-    fn do_launch(&mut self, pkg: &str, wait: bool) {
+    fn do_launch(&mut self, pkg: &str) {
         use std::process::Command;
 
         if pkg.is_empty() {
-            self.log_error("usage: launch [-w] <package>");
+            self.log_error("usage: launch <package>");
             return;
-        }
-
-        if wait {
-            // Set debug-wait flag so app suspends at startup
-            self.log_info(&format!("Setting debug-wait for {}...", pkg));
-            let _ = Command::new("adb")
-                .args(["shell", "am", "set-debug-app", "-w", "--persistent", pkg])
-                .output();
         }
 
         // Find and start the main activity
@@ -4903,16 +5256,10 @@ impl App {
             }
         }
 
-        if wait {
-            self.log_info("App started in suspended mode (waiting for debugger)");
-            self.log_info("Use: attach <package> to inject agent and connect");
-            self.log_info("Then: adb shell am clear-debug-app  (to release on next launch)");
-        } else {
-            // Give app a moment to start, then attach
-            self.log_info("App started, waiting for init...");
-            std::thread::sleep(Duration::from_millis(1500));
-            self.do_attach(pkg);
-        }
+        // Give app a moment to start, then attach
+        self.log_info("App started, waiting for init...");
+        std::thread::sleep(Duration::from_millis(1500));
+        self.do_attach(pkg);
     }
 
     /// Resolve short class name in a BpSet command.
@@ -4995,7 +5342,6 @@ impl App {
         self.log_info("  procs           - List running app processes");
         self.log_info("  attach <pkg>    - Inject agent + forward + connect + load APK");
         self.log_info("  launch <pkg>    - Start app + attach (one shot)");
-        self.log_info("  launch -w <p>   - Start app suspended (debug-wait)");
         self.log_info("  connect         - Connect to agent (127.0.0.1:12345)");
         self.log_info("  disconnect      - Disconnect");
         self.log_info("  cls [pattern]   - List loaded classes");
@@ -5051,6 +5397,17 @@ impl App {
         self.log_info("  rec tree        - Tree trace (indented call tree)");
         self.log_info("  dex-dump        - Extract DEX from DexClassLoader (while suspended)");
         self.log_info("  dex-read <p>    - Read DEX/JAR file from device by path");
+        self.log_info("  alias <sig> <label>  - Set display alias for a class");
+        self.log_info("  alias list      - List all aliases");
+        self.log_info("  alias clear <sig>  - Remove alias (* for all)");
+        self.log_info("  hook <cls> <m> <action>  - Add intercept hook (log-continue, force-return-void/0/1)");
+        self.log_info("  hook list       - List hooks");
+        self.log_info("  hook clear <cls> <m>  - Remove hook (* for all)");
+        self.log_info("  watch <expr>    - Add expression to watch list (re-evaluated on suspend)");
+        self.log_info("  unwatch <n|expr>  - Remove watch by index or expression");
+        self.log_info("  bm <label>      - Rename selected bookmark (Bookmarks tab)");
+        self.log_info("  Ctrl+B          - Toggle bookmark at bytecode cursor");
+        self.log_info("  Ctrl+S          - Save session (aliases, comments, hooks, bookmarks)");
         self.log_info("  save [file]     - Save full log to file (default: dexbgd_<ts>.log)");
         self.log_info("  ss              - Save settings to dexbgd.ini (theme, layout, history)");
         self.log_info("  ai <prompt>     - AI analysis (full autonomy)");
@@ -5189,7 +5546,13 @@ impl App {
     ///   u testDetect:0x1a4               — navigate and scroll to offset 0x1a4
     ///   u MainActivity testDetect:0x1a4  — space-separated with offset
     fn jump_to_pc(&mut self) {
-        self.bytecodes_auto_scroll = true;
+        // Scroll to show PC once and stay in manual mode — do NOT enable auto_scroll,
+        // which would lock the highlight at the same visual row during stepping.
+        if let Some(loc) = self.current_loc {
+            if let Some(idx) = self.bytecodes.iter().position(|i| i.offset == loc as u32) {
+                self.bytecodes_scroll = idx.saturating_sub(2);
+            }
+        }
     }
 
     fn do_unassemble(&mut self, arg: &str) {

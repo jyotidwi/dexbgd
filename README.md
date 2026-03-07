@@ -166,7 +166,6 @@ See [doc/ai_setup.md](doc/ai_setup.md) for setup instructions.
 procs / ps              List debuggable processes
 attach <pkg>            Inject agent + connect + load symbols
 launch <pkg>            Start app + attach
-launch -w <pkg>         Start suspended + attach
 connect                 Manual connect (127.0.0.1:12345)
 disconnect / dc         Disconnect
 ```
@@ -236,6 +235,33 @@ Ctrl+B              Toggle bookmark at bytecode cursor
 bm <label>          Rename selected bookmark (or press Enter in Bookmarks tab)
 ```
 
+### Session (per-app persistent state)
+
+Aliases, comments, bookmarks, and hooks are saved per app in `sessions/<package>.json` next to the server binary.
+
+```
+Ctrl+S              Save session for current app
+
+n                   Rename current class (IDA-style, bytecodes panel only)
+                    Empty input removes the alias.
+
+alias <sig> <label> Set display alias  e.g. alias Lcom/a/B; CertPinner
+alias list          List all aliases
+alias clear <sig>   Remove alias (or * for all)
+
+hook <cls> <m> <action>   Add app-specific intercept hook (auto-applied on next connect)
+hook list                 List hooks
+hook clear <cls> <m>      Remove hook (or * for all)
+
+Actions: log-continue, force-return-void, force-return-0, force-return-1
+```
+
+Hooks also accept `--action` on any `bp` command for one-off use:
+```
+bp Cipher doFinal --action log-continue
+bp Lcom/a/B; isRooted --action force-return-0
+```
+
 ### Patching
 ```
 patch <cls> <m> void|true|false|null|0|1   Replace method body
@@ -293,9 +319,17 @@ Shift-F10   Toggle recording
 F12         Toggle mouse capture
 Ctrl+T      Cycle color theme
 Ctrl+B      Toggle bookmark at bytecode cursor
+Ctrl+S      Save session (aliases, comments, hooks, bookmarks)
 Tab         Cycle panels (left → right → log)
 Esc         Go back / close menu
 q           Quit
+```
+
+### Bytecodes panel
+```
+n           Rename current class (opens alias dialog, IDA-style)
+;           Add/edit inline comment at cursor instruction
+p           Open patch submenu
 ```
 
 ## Targeting non-debuggable apps

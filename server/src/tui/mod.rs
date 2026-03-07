@@ -1,3 +1,4 @@
+pub mod alias_dialog;
 pub mod bytecodes;
 pub mod comment_dialog;
 pub mod command;
@@ -144,6 +145,10 @@ pub fn draw(f: &mut Frame, app: &App) -> LayoutGeometry {
     // Draw comment dialog overlay (on top of everything)
     if app.comment_open {
         comment_dialog::render(f, size, app);
+    }
+    // Draw alias/rename dialog overlay
+    if app.alias_open {
+        alias_dialog::render(f, size, app);
     }
 
     geom

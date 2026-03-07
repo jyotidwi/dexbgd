@@ -11,6 +11,25 @@ use crate::disassembler;
 use crate::theme::Theme;
 use super::make_block;
 
+/// Apply class aliases to an instruction text string.
+/// Replaces "ShortName." with "Alias." for every known alias.
+/// Only substitutes when followed by '.' to avoid false positives.
+fn apply_aliases<'a>(text: &'a str, aliases: &std::collections::HashMap<String, String>) -> std::borrow::Cow<'a, str> {
+    if aliases.is_empty() {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut result = std::borrow::Cow::Borrowed(text);
+    for (sig, label) in aliases {
+        let short = commands::short_class(sig);
+        let needle = format!("{}.", short);
+        let replace = format!("{}.", label);
+        if result.contains(needle.as_str()) {
+            result = std::borrow::Cow::Owned(result.replace(needle.as_str(), replace.as_str()));
+        }
+    }
+    result
+}
+
 pub fn draw(f: &mut Frame, app: &App, area: Rect) {
     let focused = app.focus == 0;
     let t = &app.theme;
@@ -352,14 +371,15 @@ fn draw_bytecodes(f: &mut Frame, app: &App, area: Rect, block: ratatui::widgets:
                     .map_or(false, |mref| dex.has_class(&mref.class_name))
             })
         });
+        let display_text = apply_aliases(&instr.text, &app.aliases);
         if followable && !is_current {
-            let mut colored = colorize_insn(&instr.text, line_bg, use_bold, t);
+            let mut colored = colorize_insn(&display_text, line_bg, use_bold, t);
             for span in &mut colored {
                 span.style = span.style.add_modifier(Modifier::UNDERLINED);
             }
             line_spans.extend(colored);
         } else {
-            line_spans.extend(colorize_insn(&instr.text, line_bg, use_bold, t));
+            line_spans.extend(colorize_insn(&display_text, line_bg, use_bold, t));
         }
 
         // Apply word highlight (click-to-highlight all occurrences)

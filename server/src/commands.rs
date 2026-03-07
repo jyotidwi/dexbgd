@@ -10,6 +10,15 @@ pub fn to_jni_sig(name: &str) -> String {
     format!("L{};", name.replace('.', "/"))
 }
 
+/// Return alias label if defined, else short class name.
+pub fn display_class(sig: &str, aliases: &std::collections::HashMap<String, String>) -> String {
+    if let Some(label) = aliases.get(sig) {
+        label.clone()
+    } else {
+        short_class(sig).to_string()
+    }
+}
+
 /// Shorten a JNI class signature for display.
 /// "Lcom/test/jitdemo/MainActivity;" → "MainActivity"
 pub fn short_class(sig: &str) -> &str {

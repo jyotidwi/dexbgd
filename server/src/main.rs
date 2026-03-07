@@ -12,6 +12,7 @@ mod dex_parser;
 mod dex_patcher;
 mod disassembler;
 mod protocol;
+mod session;
 mod theme;
 mod tui;
 

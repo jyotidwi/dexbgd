@@ -4,12 +4,35 @@ use crate::protocol::{LocalVar, RegValue};
 // Condition types
 // ---------------------------------------------------------------------------
 
+/// Action to take when a breakpoint fires (used for intercept hooks).
+#[derive(Debug, Clone)]
+pub enum BreakpointAction {
+    /// Log the hit and auto-continue without pausing.
+    LogAndContinue,
+    /// ForceEarlyReturn with value and auto-continue. -1 = void.
+    ForceReturn(i32),
+}
+
+pub const FORCE_RETURN_VOID: i32 = -1;
+
+/// Parse an action string into a BreakpointAction.
+pub fn parse_action(s: &str) -> Option<BreakpointAction> {
+    match s {
+        "log-continue" | "log" => Some(BreakpointAction::LogAndContinue),
+        "force-return-void" | "frv" => Some(BreakpointAction::ForceReturn(FORCE_RETURN_VOID)),
+        "force-return-0" | "fr0" => Some(BreakpointAction::ForceReturn(0)),
+        "force-return-1" | "fr1" => Some(BreakpointAction::ForceReturn(1)),
+        _ => None,
+    }
+}
+
 /// A breakpoint condition attached to a breakpoint.
 #[derive(Debug, Clone)]
 pub struct BreakpointCondition {
     pub hit_condition: Option<HitCondition>,
     pub var_condition: Option<CondExpr>,
     pub hit_count: u32,
+    pub action: Option<BreakpointAction>,
 }
 
 #[derive(Debug, Clone)]
@@ -58,11 +81,21 @@ impl BreakpointCondition {
             hit_condition: hit,
             var_condition: var,
             hit_count: 0,
+            action: None,
+        }
+    }
+
+    pub fn for_action(action: BreakpointAction) -> Self {
+        Self {
+            hit_condition: None,
+            var_condition: None,
+            hit_count: 0,
+            action: Some(action),
         }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.hit_condition.is_none() && self.var_condition.is_none()
+        self.hit_condition.is_none() && self.var_condition.is_none() && self.action.is_none()
     }
 
 }
@@ -91,7 +124,20 @@ impl std::fmt::Display for BreakpointCondition {
         if let Some(expr) = &self.var_condition {
             parts.push(format!("when {}", expr));
         }
+        if let Some(action) = &self.action {
+            parts.push(format!("action={}", action));
+        }
         write!(f, "{}", parts.join(" "))
+    }
+}
+
+impl std::fmt::Display for BreakpointAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BreakpointAction::LogAndContinue => write!(f, "log-continue"),
+            BreakpointAction::ForceReturn(FORCE_RETURN_VOID) => write!(f, "force-return-void"),
+            BreakpointAction::ForceReturn(v) => write!(f, "force-return-{}", v),
+        }
     }
 }
 
@@ -137,6 +183,7 @@ impl std::fmt::Display for CondOp {
 pub fn parse_condition_flags(args: &str) -> Result<(String, Option<BreakpointCondition>), String> {
     let mut hit_cond: Option<HitCondition> = None;
     let mut var_cond: Option<CondExpr> = None;
+    let mut action: Option<BreakpointAction> = None;
     let mut clean_parts: Vec<&str> = Vec::new();
 
     let parts: Vec<&str> = args.split_whitespace().collect();
@@ -176,6 +223,15 @@ pub fn parse_condition_flags(args: &str) -> Result<(String, Option<BreakpointCon
                 // Skip all tokens consumed by the expression
                 break; // --when consumes the rest
             }
+            "--action" => {
+                i += 1;
+                if i >= parts.len() {
+                    return Err("--action requires a value (log-continue, force-return-void, force-return-0, force-return-1)".into());
+                }
+                action = Some(parse_action(parts[i]).ok_or_else(|| {
+                    format!("unknown --action '{}'. Use: log-continue, force-return-void, force-return-0, force-return-1", parts[i])
+                })?);
+            }
             _ => {
                 clean_parts.push(parts[i]);
             }
@@ -184,10 +240,12 @@ pub fn parse_condition_flags(args: &str) -> Result<(String, Option<BreakpointCon
     }
 
     let clean = clean_parts.join(" ");
-    if hit_cond.is_none() && var_cond.is_none() {
+    if hit_cond.is_none() && var_cond.is_none() && action.is_none() {
         Ok((clean, None))
     } else {
-        Ok((clean, Some(BreakpointCondition::new(hit_cond, var_cond))))
+        let mut cond = BreakpointCondition::new(hit_cond, var_cond);
+        cond.action = action;
+        Ok((clean, Some(cond)))
     }
 }
 

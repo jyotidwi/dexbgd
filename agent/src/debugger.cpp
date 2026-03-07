@@ -4401,6 +4401,18 @@ static void* SocketThread(void* arg) {
             json_add_int(&jb, "pid", getpid());
             json_add_string(&jb, "version", "dexbgd-agent-1.0");
 
+            // Read package name from /proc/self/cmdline (process name = package on Android)
+            {
+                char cmdline[256] = "";
+                int cfd = open("/proc/self/cmdline", O_RDONLY);
+                if (cfd >= 0) {
+                    ssize_t n = read(cfd, cmdline, sizeof(cmdline) - 1);
+                    if (n > 0) cmdline[n] = '\0';
+                    close(cfd);
+                }
+                if (cmdline[0]) json_add_string(&jb, "package_name", cmdline);
+            }
+
             // Add device info
             {
                 char sdk[8] = "", rel[16] = "", model[64] = "";
