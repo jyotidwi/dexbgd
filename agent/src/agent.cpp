@@ -773,6 +773,13 @@ static void JNICALL OnThreadEnd(
     HandleStepThreadEnd(jvmti, jni, thread);
 }
 
+static void JNICALL OnThreadStart(
+        jvmtiEnv* jvmti,
+        JNIEnv* jni,
+        jthread thread) {
+    HandleThreadStart(jvmti, jni, thread);
+}
+
 // Callback: breakpoint hit — enter debugger command loop
 static void JNICALL OnBreakpoint(
         jvmtiEnv* jvmti,
@@ -1288,7 +1295,8 @@ static jint SetupJvmtiAgent(JavaVM* vm, const char* entry_point) {
     if (have_class_prepare) {
         callbacks.ClassPrepare = OnClassPrepare;
     }
-    callbacks.ThreadEnd = OnThreadEnd;
+    callbacks.ThreadEnd   = OnThreadEnd;
+    callbacks.ThreadStart = OnThreadStart;
 
     err = jvmti->SetEventCallbacks(&callbacks, sizeof(callbacks));
     if (err != JVMTI_ERROR_NONE) {
@@ -1348,6 +1356,14 @@ static jint SetupJvmtiAgent(JavaVM* vm, const char* entry_point) {
         ALOGW("Enable THREAD_END failed: %d", err);
     } else {
         ALOGI("THREAD_END enabled OK");
+    }
+
+    err = jvmti->SetEventNotificationMode(JVMTI_ENABLE,
+            JVMTI_EVENT_THREAD_START, nullptr);
+    if (err != JVMTI_ERROR_NONE) {
+        ALOGW("Enable THREAD_START failed: %d", err);
+    } else {
+        ALOGI("THREAD_START enabled OK");
     }
 
     if (have_class_prepare) {

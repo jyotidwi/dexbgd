@@ -5,7 +5,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use crate::ai::{AiLineKind, AiState};
-use crate::app::{App, CallCategory, LeftTab};
+use crate::app::{App, CallCategory, JniNativeEntry, LeftTab};
 use crate::commands;
 use crate::disassembler;
 use crate::theme::Theme;
@@ -34,12 +34,13 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
     let focused = app.focus == 0;
     let t = &app.theme;
 
-    let tabs = ["Bytecodes", "Decompiler", "Trace", " AI "];
+    let tabs = ["Bytecodes", "Decompiler", "Trace", " AI ", "JNI"];
     let active_idx = match app.left_tab {
         LeftTab::Bytecodes => 0,
         LeftTab::Decompiler => 1,
         LeftTab::Trace => 2,
         LeftTab::Ai => 3,
+        LeftTab::JniMonitor => 4,
     };
 
     let mut spans = vec![Span::raw(" ")];
@@ -75,6 +76,9 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
         }
         LeftTab::Ai => {
             draw_ai(f, app, area, block);
+        }
+        LeftTab::JniMonitor => {
+            draw_jni_monitor(f, app, area, block);
         }
     }
 }
@@ -992,4 +996,151 @@ fn draw_ai(f: &mut Frame, app: &App, area: Rect, block: ratatui::widgets::Block<
 
     let para = Paragraph::new(lines).block(block);
     f.render_widget(para, area);
+}
+
+// ---------------------------------------------------------------------------
+// JNI monitor panel
+// ---------------------------------------------------------------------------
+
+/// Decode a single JNI type descriptor token.
+/// Returns (human_type, remaining_str).
+fn demangle_one(s: &str) -> (String, &str) {
+    let b = s.as_bytes();
+    if b.is_empty() { return ("?".into(), s); }
+    match b[0] {
+        b'Z' => ("boolean".into(), &s[1..]),
+        b'B' => ("byte".into(),    &s[1..]),
+        b'C' => ("char".into(),    &s[1..]),
+        b'S' => ("short".into(),   &s[1..]),
+        b'I' => ("int".into(),     &s[1..]),
+        b'J' => ("long".into(),    &s[1..]),
+        b'F' => ("float".into(),   &s[1..]),
+        b'D' => ("double".into(),  &s[1..]),
+        b'V' => ("void".into(),    &s[1..]),
+        b'[' => {
+            let (inner, rest) = demangle_one(&s[1..]);
+            (format!("{}[]", inner), rest)
+        }
+        b'L' => {
+            if let Some(end) = s.find(';') {
+                let path = &s[1..end];
+                let simple = path.split('/').last().unwrap_or(path);
+                (simple.into(), &s[end + 1..])
+            } else {
+                ("Object".into(), "")
+            }
+        }
+        _ => ("?".into(), &s[1..]),
+    }
+}
+
+/// Convert a JNI method signature + name to a readable string.
+/// e.g. "checkIntegrity", "()Z"  ->  "boolean checkIntegrity()"
+/// e.g. "getKey", "([B)[B"       ->  "byte[] getKey(byte[])"
+pub fn demangle_jni_sig(method_name: &str, jni_sig: &str) -> String {
+    let paren = jni_sig.find(')').unwrap_or(jni_sig.len());
+    let params_str = &jni_sig[1..paren.min(jni_sig.len())];
+    let ret_str    = if paren + 1 < jni_sig.len() { &jni_sig[paren + 1..] } else { "V" };
+
+    let (ret_type, _) = demangle_one(ret_str);
+
+    let mut params: Vec<String> = Vec::new();
+    let mut rem = params_str;
+    while !rem.is_empty() {
+        let (t, rest) = demangle_one(rem);
+        params.push(t);
+        rem = rest;
+    }
+
+    format!("{} {}({})", ret_type, method_name, params.join(", "))
+}
+
+fn draw_jni_monitor(f: &mut Frame, app: &App, area: Rect, block: ratatui::widgets::Block<'_>) {
+    let inner_height = area.height.saturating_sub(2) as usize;
+    let t = &app.theme;
+
+    if app.jni_natives.is_empty() {
+        let msg = if app.jni_monitoring {
+            "(monitoring — waiting for RegisterNatives calls)"
+        } else {
+            "(no bindings captured — use 'jni monitor' to start)"
+        };
+        let text = Paragraph::new(msg).block(block).style(Style::default().fg(t.ui_dim));
+        f.render_widget(text, area);
+        return;
+    }
+
+    let status_suffix = if app.jni_monitoring {
+        Span::styled(" (monitoring)", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
+    } else {
+        Span::styled(" (stopped)", Style::default().fg(t.ui_dim))
+    };
+
+    let header = Line::from(vec![
+        Span::styled(
+            format!(" {} native bindings", app.jni_natives.len()),
+            Style::default().fg(t.ui_accent).add_modifier(Modifier::BOLD),
+        ),
+        status_suffix,
+        Span::styled(
+            "   jni redirect <cls> <method> <sig> <block|true|false>",
+            Style::default().fg(t.ui_dim),
+        ),
+    ]);
+
+    let list_height = inner_height.saturating_sub(1);
+    let scroll = app.jni_monitor_scroll.min(app.jni_natives.len().saturating_sub(1));
+
+    let mut lines: Vec<Line> = Vec::with_capacity(inner_height);
+    lines.push(header);
+
+    for entry in app.jni_natives.iter().skip(scroll).take(list_height) {
+        lines.push(format_jni_entry(entry, t));
+    }
+
+    let para = Paragraph::new(lines).block(block);
+    f.render_widget(para, area);
+}
+
+fn format_jni_entry(e: &JniNativeEntry, t: &Theme) -> Line<'static> {
+    // lib+offset column: "libnative.so+0x1b10"
+    let addr_str = if e.lib_name.is_empty() || e.lib_name == "[anon]" {
+        format!("0x{:x}", e.native_addr as u64)
+    } else {
+        format!("{}+0x{:x}", e.lib_name, e.lib_offset as u64)
+    };
+
+    // Short class name: "Lcom/example/Shield;" -> "Shield"
+    let short_class = {
+        let inner = e.class_sig.trim_start_matches('L').trim_end_matches(';');
+        inner.split('/').last().unwrap_or(inner).to_string()
+    };
+
+    let readable = demangle_jni_sig(&e.method_name, &e.method_sig);
+
+    let redirect_tag = if e.redirected {
+        let action = e.redirect_action.as_deref().unwrap_or("?");
+        format!(" [->{}]", action)
+    } else {
+        String::new()
+    };
+
+    Line::from(vec![
+        Span::styled(
+            format!("  {:36}", addr_str),
+            Style::default().fg(Color::Cyan),
+        ),
+        Span::styled(
+            format!("{}.", short_class),
+            Style::default().fg(t.ui_dim),
+        ),
+        Span::styled(
+            readable,
+            Style::default().fg(t.ui_text),
+        ),
+        Span::styled(
+            redirect_tag,
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        ),
+    ])
 }

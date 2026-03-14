@@ -6,6 +6,7 @@
 #include <pthread.h>
 #include <vector>
 #include <string>
+#include <map>
 #include <atomic>
 
 // ---------------------------------------------------------------------------
@@ -43,6 +44,16 @@ struct DebuggerCommand {
     char raw[4096];  // full JSON line for commands that need extra params
 };
 
+// A redirected JNI native method: original pointer saved so it can be restored.
+struct JniRedirect {
+    void* original_fnptr;    // captured from RegisterNatives hook, or null if unknown
+    char  class_sig[256];
+    char  method_name[128];
+    char  method_sig[256];
+    char  action[32];        // "block", "true", "spoof"
+    int64_t spoof_value;
+};
+
 struct DebuggerState {
     jvmtiEnv* jvmti;
     JavaVM* vm;
@@ -70,6 +81,14 @@ struct DebuggerState {
     std::atomic<bool> thread_suspended;
 
     bool running;
+
+    // JNI monitor / redirect state
+    std::atomic<bool> jni_monitoring;   // toggled by jni_monitor_start/stop
+    JNINativeInterface jni_hooked_table;          // our patched vtable copy
+    const JNINativeInterface* jni_original_table; // ART's original vtable
+    std::map<std::string, JniRedirect> jni_redirects; // key = "sig:name:msig"
+    pthread_mutex_t jni_redirect_mutex;
+    std::atomic<int> jni_capture_count; // total RegisterNatives captures this session
 
     // Call recording state
     std::atomic<bool> recording;        // toggled by record_start/record_stop
@@ -135,5 +154,13 @@ void FormatObjectValue(JNIEnv* jni, jobject obj, char* out, size_t out_len, bool
 // Checks g_pending_bps for any BPs waiting on this class, sets them, and
 // sends bp_set_ok to the server for each one.
 void HandleClassPrepare(jvmtiEnv* jvmti, JNIEnv* jni, jthread thread, jclass klass);
+
+// Called from OnThreadStart callback in agent.cpp.
+// If JNI monitoring is active, patches the new thread's JNIEnv vtable.
+void HandleThreadStart(jvmtiEnv* jvmti, JNIEnv* jni, jthread thread);
+
+// Patch a JNIEnv's function table to intercept RegisterNatives.
+// Safe to call multiple times on the same env (idempotent).
+void PatchJniEnvForMonitor(JNIEnv* env);
 
 #endif // DEXBGD_DEBUGGER_H

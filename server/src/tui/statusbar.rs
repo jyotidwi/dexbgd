@@ -74,6 +74,7 @@ fn panel_name(app: &App) -> &'static str {
             LeftTab::Decompiler => "Decompiler",
             LeftTab::Trace => "Trace",
             LeftTab::Ai => "AI",
+            LeftTab::JniMonitor => "JNI",
         },
         1 => match app.locals_tab {
             LocalsTab::Locals => "Locals",

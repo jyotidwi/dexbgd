@@ -3902,6 +3902,343 @@ static void CmdSuspend(jvmtiEnv* jvmti, JNIEnv* jni, const char* json) {
 }
 
 // ---------------------------------------------------------------------------
+// JNI monitoring — jni_monitor_start / stop / redirect
+// ---------------------------------------------------------------------------
+
+// Resolve an arbitrary native address to a library basename + offset within
+// that library's loaded region.  Uses /proc/self/maps.
+// Returns false if the address could not be mapped.
+static bool ResolveNativeAddr(void* addr, char* lib_out, size_t lib_sz, uintptr_t* offset_out) {
+    FILE* f = fopen("/proc/self/maps", "r");
+    if (!f) return false;
+
+    uintptr_t target = (uintptr_t)addr;
+    char line[512];
+    bool found = false;
+
+    while (fgets(line, sizeof(line), f)) {
+        uintptr_t start = 0, end = 0;
+        char perms[8] = "", path[256] = "";
+        unsigned long long file_offset = 0;
+        int dm = 0, dn = 0;
+        unsigned long inode = 0;
+        // Format: start-end perms offset dev inode [path]
+        sscanf(line, "%lx-%lx %4s %llx %x:%x %lu %255s",
+               &start, &end, perms, &file_offset, &dm, &dn, &inode, path);
+        if (target >= start && target < end) {
+            const char* base = strrchr(path, '/');
+            base = (base && base[1]) ? base + 1 : path;
+            strncpy(lib_out, base[0] ? base : "[anon]", lib_sz - 1);
+            lib_out[lib_sz - 1] = '\0';
+            *offset_out = target - start;
+            found = true;
+            break;
+        }
+    }
+    fclose(f);
+    return found;
+}
+
+static void SendJniRegisterNative(const char* class_sig, const char* method_name,
+                                   const char* method_sig, uint64_t native_addr,
+                                   const char* lib_name, uint64_t lib_offset) {
+    JsonBuf jb;
+    json_start(&jb);
+    json_add_string(&jb, "type", "jni_register_native");
+    json_add_string(&jb, "class_sig", class_sig);
+    json_add_string(&jb, "method_name", method_name);
+    json_add_string(&jb, "method_sig", method_sig);
+    json_add_long(&jb, "native_addr", (long long)native_addr);
+    json_add_string(&jb, "lib_name", lib_name);
+    json_add_long(&jb, "lib_offset", (long long)lib_offset);
+    json_end(&jb);
+    SendToClient(jb.buf);
+}
+
+// ---------------------------------------------------------------------------
+// JNI stub functions — installed as native method replacements.
+// Each stub matches JNI calling convention (JNIEnv*, jobject, ...) and returns
+// a zeroed/null/false value appropriate for the method's return type.
+// The "true" variants are used when action == "true" for boolean methods.
+// ---------------------------------------------------------------------------
+static jboolean jni_stub_bool_false(JNIEnv*, jobject, ...) { return JNI_FALSE; }
+static jboolean jni_stub_bool_true (JNIEnv*, jobject, ...) { return JNI_TRUE;  }
+static jint     jni_stub_int_0     (JNIEnv*, jobject, ...) { return 0; }
+static jlong    jni_stub_long_0    (JNIEnv*, jobject, ...) { return 0L; }
+static jfloat   jni_stub_float_0   (JNIEnv*, jobject, ...) { return 0.0f; }
+static jdouble  jni_stub_double_0  (JNIEnv*, jobject, ...) { return 0.0; }
+static jobject  jni_stub_null      (JNIEnv*, jobject, ...) { return nullptr; }
+static void     jni_stub_void      (JNIEnv*, jobject, ...) {}
+
+// Select stub based on JNI return type char (char after ')' in method sig)
+// and action string ("block", "true", "spoof").
+static void* SelectJniStub(char ret_char, const char* action, int64_t /*spoof_value*/) {
+    bool want_true = (strcmp(action, "true") == 0);
+    switch (ret_char) {
+        case 'Z': return (void*)(want_true ? jni_stub_bool_true : jni_stub_bool_false);
+        case 'B': case 'C': case 'S': case 'I': return (void*)jni_stub_int_0;
+        case 'J': return (void*)jni_stub_long_0;
+        case 'F': return (void*)jni_stub_float_0;
+        case 'D': return (void*)jni_stub_double_0;
+        case 'V': return (void*)jni_stub_void;
+        default:  return (void*)jni_stub_null; // L, [, or unknown -> null object
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Hook for JNIEnv::RegisterNatives
+// Intercepts calls from any thread whose JNIEnv has been patched.
+// ---------------------------------------------------------------------------
+static jint Hook_RegisterNatives(JNIEnv* env, jclass clazz,
+                                  const JNINativeMethod* methods, jint nMethods) {
+    // Resolve class signature via JVMTI (doesn't go through the JNI vtable)
+    char* class_sig = nullptr;
+    g_dbg.jvmti->GetClassSignature(clazz, &class_sig, nullptr);
+
+    for (int i = 0; i < nMethods; i++) {
+        char lib_name[256] = "[unknown]";
+        uintptr_t lib_offset = 0;
+        ResolveNativeAddr(methods[i].fnPtr, lib_name, sizeof(lib_name), &lib_offset);
+
+        SendJniRegisterNative(
+            class_sig ? class_sig : "?",
+            methods[i].name ? methods[i].name : "?",
+            methods[i].signature ? methods[i].signature : "?",
+            (uint64_t)(uintptr_t)methods[i].fnPtr,
+            lib_name, (uint64_t)lib_offset);
+
+        // Store original pointer for any matching redirect entry
+        if (class_sig && methods[i].name && methods[i].signature) {
+            std::string key = std::string(class_sig) + ":"
+                            + methods[i].name + ":"
+                            + methods[i].signature;
+            pthread_mutex_lock(&g_dbg.jni_redirect_mutex);
+            auto it = g_dbg.jni_redirects.find(key);
+            if (it != g_dbg.jni_redirects.end() && it->second.original_fnptr == nullptr) {
+                it->second.original_fnptr = methods[i].fnPtr;
+            }
+            pthread_mutex_unlock(&g_dbg.jni_redirect_mutex);
+        }
+    }
+
+    g_dbg.jni_capture_count.fetch_add(nMethods);
+    if (class_sig) g_dbg.jvmti->Deallocate((unsigned char*)class_sig);
+
+    // Call the real RegisterNatives via saved original table
+    return g_dbg.jni_original_table->RegisterNatives(env, clazz, methods, nMethods);
+}
+
+void PatchJniEnvForMonitor(JNIEnv* env) {
+    if (!env) return;
+    // Only patch if this env still points to the original table (idempotent)
+    if (env->functions == &g_dbg.jni_hooked_table) return;
+    if (env->functions != g_dbg.jni_original_table) return;
+    env->functions = &g_dbg.jni_hooked_table;
+}
+
+void HandleThreadStart(jvmtiEnv* /*jvmti*/, JNIEnv* jni, jthread /*thread*/) {
+    if (g_dbg.jni_monitoring.load() && jni) {
+        PatchJniEnvForMonitor(jni);
+    }
+}
+
+static void CmdJniMonitorStart(jvmtiEnv* /*jvmti*/, JNIEnv* jni, const char* /*json*/) {
+    if (g_dbg.jni_monitoring.load()) {
+        SendError("jni_monitor already active");
+        return;
+    }
+    if (!jni) {
+        SendError("jni_monitor: no JNIEnv available");
+        return;
+    }
+
+    // Save original vtable and build hooked copy
+    g_dbg.jni_original_table = jni->functions;
+    memcpy(&g_dbg.jni_hooked_table, g_dbg.jni_original_table, sizeof(JNINativeInterface));
+    g_dbg.jni_hooked_table.RegisterNatives = Hook_RegisterNatives;
+    g_dbg.jni_capture_count.store(0);
+    g_dbg.jni_monitoring.store(true);
+
+    // Patch this thread's env immediately; ThreadStart callback handles future threads
+    PatchJniEnvForMonitor(jni);
+
+    ALOGI("[DBG] JNI monitor started");
+    JsonBuf jb;
+    json_start(&jb);
+    json_add_string(&jb, "type", "jni_monitor_started");
+    json_end(&jb);
+    SendToClient(jb.buf);
+}
+
+static void CmdJniMonitorStop(jvmtiEnv* /*jvmti*/, JNIEnv* jni, const char* /*json*/) {
+    if (!g_dbg.jni_monitoring.load()) {
+        SendError("jni_monitor not active");
+        return;
+    }
+    g_dbg.jni_monitoring.store(false);
+
+    // Restore this thread's env; other threads will keep the hook until their
+    // next patched vtable lookup, which is harmless (we just stop capturing).
+    if (jni && jni->functions == &g_dbg.jni_hooked_table) {
+        jni->functions = g_dbg.jni_original_table;
+    }
+
+    int total = g_dbg.jni_capture_count.load();
+    ALOGI("[DBG] JNI monitor stopped (%d captures)", total);
+    JsonBuf jb;
+    json_start(&jb);
+    json_add_string(&jb, "type", "jni_monitor_stopped");
+    json_add_int(&jb, "count", total);
+    json_end(&jb);
+    SendToClient(jb.buf);
+}
+
+static void CmdJniRedirectSet(jvmtiEnv* jvmti, JNIEnv* jni, const char* json) {
+    char class_sig[256]   = {0};
+    char method_name[128] = {0};
+    char method_sig[256]  = {0};
+    char action[32]       = "block";
+    int64_t spoof_value   = 0;
+
+    if (!json_get_string(json, "class_sig",   class_sig,   sizeof(class_sig))  ||
+        !json_get_string(json, "method_name", method_name, sizeof(method_name))||
+        !json_get_string(json, "method_sig",  method_sig,  sizeof(method_sig))) {
+        SendError("jni_redirect_set: missing class_sig/method_name/method_sig");
+        return;
+    }
+    json_get_string(json, "action", action, sizeof(action));
+    // spoof_value: optional int64 (parse manually if present)
+    {
+        const char* p = strstr(json, "\"spoof_value\"");
+        if (p) { p = strchr(p, ':'); if (p) spoof_value = (int64_t)strtoll(p + 1, nullptr, 10); }
+    }
+
+    jclass klass = FindClassBySig(jvmti, jni, class_sig);
+    if (!klass) {
+        SendError("jni_redirect_set: class not loaded: %s", class_sig);
+        return;
+    }
+
+    // Determine return type from method signature (char after ')')
+    const char* ret_ptr = strrchr(method_sig, ')');
+    if (!ret_ptr || !ret_ptr[1]) {
+        jni->DeleteGlobalRef(klass);
+        SendError("jni_redirect_set: bad method_sig %s", method_sig);
+        return;
+    }
+    char ret_char = ret_ptr[1];
+    void* stub = SelectJniStub(ret_char, action, spoof_value);
+
+    // Save original pointer if we have it from monitor captures
+    std::string key = std::string(class_sig) + ":" + method_name + ":" + method_sig;
+    void* original = nullptr;
+    pthread_mutex_lock(&g_dbg.jni_redirect_mutex);
+    auto it = g_dbg.jni_redirects.find(key);
+    if (it != g_dbg.jni_redirects.end()) {
+        original = it->second.original_fnptr;
+    }
+    pthread_mutex_unlock(&g_dbg.jni_redirect_mutex);
+
+    // Durable string storage for the JNINativeMethod (ART may keep the pointer)
+    JniRedirect redir;
+    memset(&redir, 0, sizeof(redir));
+    redir.original_fnptr = original;
+    strncpy(redir.class_sig,   class_sig,   sizeof(redir.class_sig) - 1);
+    strncpy(redir.method_name, method_name, sizeof(redir.method_name) - 1);
+    strncpy(redir.method_sig,  method_sig,  sizeof(redir.method_sig) - 1);
+    strncpy(redir.action,      action,      sizeof(redir.action) - 1);
+    redir.spoof_value = spoof_value;
+
+    pthread_mutex_lock(&g_dbg.jni_redirect_mutex);
+    g_dbg.jni_redirects[key] = redir;
+    JniRedirect& stored = g_dbg.jni_redirects[key];
+    pthread_mutex_unlock(&g_dbg.jni_redirect_mutex);
+
+    JNINativeMethod nm;
+    nm.name      = stored.method_name;
+    nm.signature = stored.method_sig;
+    nm.fnPtr     = stub;
+    jint err = jni->RegisterNatives(klass, &nm, 1);
+    jni->DeleteGlobalRef(klass);
+
+    if (err != 0) {
+        SendError("jni_redirect_set: RegisterNatives failed: err=%d", (int)err);
+        return;
+    }
+
+    ALOGI("[DBG] JNI redirect set: %s.%s%s -> %s", class_sig, method_name, method_sig, action);
+    JsonBuf jb;
+    json_start(&jb);
+    json_add_string(&jb, "type", "jni_redirect_ok");
+    json_add_string(&jb, "class_sig",   class_sig);
+    json_add_string(&jb, "method_name", method_name);
+    json_add_string(&jb, "method_sig",  method_sig);
+    json_end(&jb);
+    SendToClient(jb.buf);
+}
+
+static void CmdJniRedirectClear(jvmtiEnv* jvmti, JNIEnv* jni, const char* json) {
+    char class_sig[256]   = {0};
+    char method_name[128] = {0};
+    char method_sig[256]  = {0};
+
+    if (!json_get_string(json, "class_sig",   class_sig,   sizeof(class_sig))  ||
+        !json_get_string(json, "method_name", method_name, sizeof(method_name))||
+        !json_get_string(json, "method_sig",  method_sig,  sizeof(method_sig))) {
+        SendError("jni_redirect_clear: missing fields");
+        return;
+    }
+
+    std::string key = std::string(class_sig) + ":" + method_name + ":" + method_sig;
+    pthread_mutex_lock(&g_dbg.jni_redirect_mutex);
+    auto it = g_dbg.jni_redirects.find(key);
+    void* original = (it != g_dbg.jni_redirects.end()) ? it->second.original_fnptr : nullptr;
+    if (it != g_dbg.jni_redirects.end()) g_dbg.jni_redirects.erase(it);
+    pthread_mutex_unlock(&g_dbg.jni_redirect_mutex);
+
+    if (!original) {
+        SendError("jni_redirect_clear: no original pointer saved for %s.%s — was it captured by monitor?",
+                  class_sig, method_name);
+        return;
+    }
+
+    jclass klass = FindClassBySig(jvmti, jni, class_sig);
+    if (!klass) {
+        SendError("jni_redirect_clear: class not loaded: %s", class_sig);
+        return;
+    }
+
+    // method_name/method_sig need to persist — use static buffers from the redir struct
+    // (already erased from map, but we have local copies)
+    static char s_method_name[128];
+    static char s_method_sig[256];
+    strncpy(s_method_name, method_name, sizeof(s_method_name) - 1);
+    strncpy(s_method_sig,  method_sig,  sizeof(s_method_sig) - 1);
+
+    JNINativeMethod nm;
+    nm.name      = s_method_name;
+    nm.signature = s_method_sig;
+    nm.fnPtr     = original;
+    jint err = jni->RegisterNatives(klass, &nm, 1);
+    jni->DeleteGlobalRef(klass);
+
+    if (err != 0) {
+        SendError("jni_redirect_clear: RegisterNatives failed: err=%d", (int)err);
+        return;
+    }
+
+    ALOGI("[DBG] JNI redirect cleared: %s.%s%s", class_sig, method_name, method_sig);
+    JsonBuf jb;
+    json_start(&jb);
+    json_add_string(&jb, "type", "jni_redirect_cleared");
+    json_add_string(&jb, "class_sig",   class_sig);
+    json_add_string(&jb, "method_name", method_name);
+    json_add_string(&jb, "method_sig",  method_sig);
+    json_end(&jb);
+    SendToClient(jb.buf);
+}
+
+// ---------------------------------------------------------------------------
 // Call recording — record_start / record_stop
 // ---------------------------------------------------------------------------
 
@@ -4175,6 +4512,14 @@ static void DispatchGlobalCommand(jvmtiEnv* jvmti, JNIEnv* jni,
         CmdRedefineClass(jvmti, jni, json);
     } else if (strcmp(cmd, "gate_release") == 0) {
         CmdGateRelease(jvmti, jni, json);
+    } else if (strcmp(cmd, "jni_monitor_start") == 0) {
+        CmdJniMonitorStart(jvmti, jni, json);
+    } else if (strcmp(cmd, "jni_monitor_stop") == 0) {
+        CmdJniMonitorStop(jvmti, jni, json);
+    } else if (strcmp(cmd, "jni_redirect_set") == 0) {
+        CmdJniRedirectSet(jvmti, jni, json);
+    } else if (strcmp(cmd, "jni_redirect_clear") == 0) {
+        CmdJniRedirectClear(jvmti, jni, json);
     } else {
         SendError("unknown cmd: %s", cmd);
     }
@@ -4539,6 +4884,11 @@ void StartDebugger(jvmtiEnv* jvmti, JavaVM* vm) {
     g_dbg.calls_this_second = 0;
     g_dbg.rate_limit_epoch = 0;
     g_dbg.pending_redefine_json = nullptr;
+    g_dbg.jni_monitoring.store(false);
+    g_dbg.jni_original_table = nullptr;
+    memset(&g_dbg.jni_hooked_table, 0, sizeof(g_dbg.jni_hooked_table));
+    g_dbg.jni_capture_count.store(0);
+    pthread_mutex_init(&g_dbg.jni_redirect_mutex, nullptr);
 
     // Populate capability flags from what JVMTI actually granted
     {

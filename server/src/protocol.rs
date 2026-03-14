@@ -229,6 +229,36 @@ pub enum AgentMessage {
     #[serde(rename = "redefine_error")]
     RedefineError { class_sig: String, err: i32 },
 
+    #[serde(rename = "jni_monitor_started")]
+    JniMonitorStarted {},
+
+    #[serde(rename = "jni_monitor_stopped")]
+    JniMonitorStopped { count: i32 },
+
+    #[serde(rename = "jni_register_native")]
+    JniRegisterNative {
+        class_sig: String,
+        method_name: String,
+        method_sig: String,
+        native_addr: i64,
+        lib_name: String,
+        lib_offset: i64,
+    },
+
+    #[serde(rename = "jni_redirect_ok")]
+    JniRedirectOk {
+        class_sig: String,
+        method_name: String,
+        method_sig: String,
+    },
+
+    #[serde(rename = "jni_redirect_cleared")]
+    JniRedirectCleared {
+        class_sig: String,
+        method_name: String,
+        method_sig: String,
+    },
+
     #[serde(rename = "error")]
     Error { msg: String },
 
@@ -504,5 +534,31 @@ pub enum OutboundCommand {
         /// Absent (None) means do not force — used for nop patches where execution continues.
         #[serde(skip_serializing_if = "Option::is_none")]
         return_value: Option<i32>,
+    },
+
+    #[serde(rename = "jni_monitor_start")]
+    JniMonitorStart {},
+
+    #[serde(rename = "jni_monitor_stop")]
+    JniMonitorStop {},
+
+    /// Replace a native method's function pointer with a stub.
+    /// action: "block" (return 0/null/false/void), "true" (return 1 for Z), "spoof" (return spoof_value)
+    #[serde(rename = "jni_redirect_set")]
+    JniRedirectSet {
+        class_sig: String,
+        method_name: String,
+        method_sig: String,
+        action: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        spoof_value: Option<i64>,
+    },
+
+    /// Restore a previously redirected native method to its original function pointer.
+    #[serde(rename = "jni_redirect_clear")]
+    JniRedirectClear {
+        class_sig: String,
+        method_name: String,
+        method_sig: String,
     },
 }

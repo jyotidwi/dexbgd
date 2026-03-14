@@ -25,7 +25,7 @@ Frida replaces functions with JavaScript hooks. dexbgd **pauses execution** and 
 | Built-in DEX disassembler | Yes, live PC & frames | Need external tools (jadx, baksmali) |
 | Live heap search | `heap SecretKey` | Custom scripting required |
 | Auto-intercept dynamic class loading | Built-in | Requires scripting |
-| Native code | No (DEX bytecode only) | Yes (multi-arch native) |
+| Native code | JNI monitor + redirect | Yes (multi-arch native) |
 | Detection surface | Standard debug API + optional ptrace | frida-server, gadget, ptrace |
 | Requires debuggable | Yes (or bypass via root + ptrace) | No (needs root or repackage) |
 
@@ -289,6 +289,79 @@ rec clear           Clear recorded calls
 rec onenter         Entry-only (no exit/return lines)
 dex-dump            Extract DEX from DexClassLoader
 dex-read <path>     Read DEX from device
+```
+
+### JNI Monitor
+
+Intercepts `RegisterNatives` calls to map Java methods to native function pointers, then lets you swap those pointers with stubs — without patching native code or triggering integrity checks.
+
+```
+jni monitor         Hook JNIEnv::RegisterNatives (all threads)
+jni stop            Stop monitoring, restore vtable
+jni clear           Clear captured binding list
+```
+
+Click the **JNI** tab in the tab bar to view captured bindings. Right-click anywhere in the JNI panel to start/stop monitoring, or right-click a binding to get a context menu with the function name and Redirect / Restore options — no typing required.
+
+Each captured binding is shown as:
+
+```
+libnative.so+0x1b10         Shield.boolean checkIntegrity()
+libnative.so+0x2c40         Shield.byte[] getKey(byte[])
+libapp.so+0x4000            App.void nativeInit()
+```
+
+The lib+offset is stable across runs (ASLR-independent) and maps directly to Ghidra.
+
+**Redirect a native method to a stub:**
+
+```
+jni redirect <class_sig> <method_name> <method_sig> <action>
+jni redirect <lib+0xOFFSET | 0xADDR> <action>
+
+Actions:
+  block       return 0 / null / false / void  (by return type)
+  true        return 1  (for boolean methods)
+  spoof N     return integer N
+
+Examples:
+jni redirect Lcom/guard/Shield; checkIntegrity ()Z block
+jni redirect Lcom/guard/Shield; isDebugger ()Z false
+jni redirect Lcom/guard/Shield; getTrialCount ()I spoof 999
+
+# Same thing using the address shown in the JNI panel (copy-paste friendly):
+jni redirect libnative.so+0x1b10 block
+jni redirect 0x7a3f2b10 true
+```
+
+**Restore the original:**
+
+```
+jni restore Lcom/guard/Shield; checkIntegrity ()Z
+jni restore libnative.so+0x1b10
+jni restore 0x7a3f2b10
+```
+
+Restore requires the original pointer to have been captured by `jni monitor` first.
+
+**Typical workflow for a native protector:**
+
+```
+> jni monitor
+> c
+  [app initializes — native libs load and call RegisterNatives]
+  libnative.so+0x1b10  Shield.boolean checkIntegrity()  [->block]
+  libnative.so+0x2c40  Shield.boolean isRooted()
+  libnative.so+0x3a80  Shield.String getKey(String)
+
+> jni redirect Lcom/guard/Shield; checkIntegrity ()Z block
+  JNI redirect installed: Lcom/guard/Shield;.checkIntegrity
+> jni redirect Lcom/guard/Shield; isRooted ()Z block
+  JNI redirect installed: Lcom/guard/Shield;.isRooted
+
+> jni stop
+> c
+  [app continues — both native integrity checks silently return false]
 ```
 
 ### AI

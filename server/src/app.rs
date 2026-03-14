@@ -145,6 +145,22 @@ pub enum LeftTab {
     Decompiler,
     Trace,
     Ai,
+    JniMonitor,
+}
+
+/// A native method binding captured from RegisterNatives or created via redirect.
+#[derive(Debug, Clone)]
+pub struct JniNativeEntry {
+    pub class_sig: String,
+    pub method_name: String,
+    pub method_sig: String,
+    pub native_addr: i64,
+    pub lib_name: String,
+    pub lib_offset: i64,
+    /// True when a redirect stub is installed in place of the original function.
+    pub redirected: bool,
+    /// The redirect action in effect ("block", "true", "spoof"), if any.
+    pub redirect_action: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -262,6 +278,7 @@ pub enum ContextMenuSource {
     Tabbed,
     PatchSubmenu,
     CommandInput,
+    JniMonitor,
 }
 
 /// Saved bytecodes view state for Esc-back navigation after double-click follow.
@@ -477,6 +494,11 @@ pub struct App {
     /// Consumed by the next matching BpSetOk to re-attach conditions.
     pub redefine_restore: Vec<(String, String, i64, Option<crate::condition::BreakpointCondition>)>,
 
+    // JNI monitor
+    pub jni_natives: Vec<JniNativeEntry>,
+    pub jni_monitoring: bool,
+    pub jni_monitor_scroll: usize,
+
     // Call recording
     pub call_records: Vec<CallRecord>,
     pub recording_active: bool,
@@ -650,6 +672,9 @@ impl App {
             aliases: HashMap::new(),
             hooks: Vec::new(),
             redefine_restore: Vec::new(),
+            jni_natives: Vec::new(),
+            jni_monitoring: false,
+            jni_monitor_scroll: 0,
             call_records: Vec::new(),
             recording_active: false,
             trace_scroll: 0,
@@ -1544,6 +1569,55 @@ impl App {
                 self.trace_auto_scroll = true;
             }
 
+            AgentMessage::JniMonitorStarted {} => {
+                self.jni_monitoring = true;
+                self.left_tab = LeftTab::JniMonitor;
+                self.log_info("JNI monitor started — watching RegisterNatives");
+            }
+
+            AgentMessage::JniMonitorStopped { count } => {
+                self.jni_monitoring = false;
+                self.log_info(&format!("JNI monitor stopped ({} bindings captured)", count));
+            }
+
+            AgentMessage::JniRegisterNative { class_sig, method_name, method_sig, native_addr, lib_name, lib_offset } => {
+                // Update existing entry or append
+                let key_match = self.jni_natives.iter().position(|e| {
+                    e.class_sig == class_sig && e.method_name == method_name && e.method_sig == method_sig
+                });
+                if let Some(idx) = key_match {
+                    // Update address in case it changed (re-registration)
+                    self.jni_natives[idx].native_addr = native_addr;
+                    self.jni_natives[idx].lib_name    = lib_name;
+                    self.jni_natives[idx].lib_offset  = lib_offset;
+                } else {
+                    self.jni_natives.push(JniNativeEntry {
+                        class_sig, method_name, method_sig,
+                        native_addr, lib_name, lib_offset,
+                        redirected: false, redirect_action: None,
+                    });
+                }
+            }
+
+            AgentMessage::JniRedirectOk { class_sig, method_name, method_sig } => {
+                if let Some(e) = self.jni_natives.iter_mut().find(|e| {
+                    e.class_sig == class_sig && e.method_name == method_name && e.method_sig == method_sig
+                }) {
+                    e.redirected = true;
+                }
+                self.log_info(&format!("JNI redirect installed: {}.{}", class_sig, method_name));
+            }
+
+            AgentMessage::JniRedirectCleared { class_sig, method_name, method_sig } => {
+                if let Some(e) = self.jni_natives.iter_mut().find(|e| {
+                    e.class_sig == class_sig && e.method_name == method_name && e.method_sig == method_sig
+                }) {
+                    e.redirected = false;
+                    e.redirect_action = None;
+                }
+                self.log_info(&format!("JNI redirect cleared: {}.{}", class_sig, method_name));
+            }
+
             AgentMessage::RecordStarted {} => {
                 self.recording_active = true;
                 self.left_tab = LeftTab::Trace;
@@ -2343,6 +2417,87 @@ impl App {
                             self.command_focused = false;
                         }
                     }
+                    // Right-click in JNI Monitor panel
+                    else if self.left_tab == LeftTab::JniMonitor
+                        && col > ba.x && col < ba.x + ba.width.saturating_sub(1)
+                        && row > ba.y && row < ba.y + ba.height.saturating_sub(1)
+                    {
+                        let inner_y = (row - ba.y - 1) as usize;
+                        let inner_height = ba.height.saturating_sub(2) as usize;
+                        let list_height = inner_height.saturating_sub(1); // subtract header row
+                        let monitor_label = if self.jni_monitoring {
+                            "  Stop monitoring   "
+                        } else {
+                            "  Start monitoring  "
+                        };
+                        let mut entry_menu = false;
+                        if inner_y > 0 && inner_y <= list_height && !self.jni_natives.is_empty() {
+                            let scroll = self.jni_monitor_scroll.min(
+                                self.jni_natives.len().saturating_sub(1)
+                            );
+                            let jni_idx = scroll + (inner_y - 1);
+                            if let Some(entry) = self.jni_natives.get(jni_idx) {
+                                entry_menu = true;
+                                let already_redirected = entry.redirected;
+                                let readable = crate::tui::bytecodes::demangle_jni_sig(
+                                    &entry.method_name, &entry.method_sig,
+                                );
+                                let short_class = {
+                                    let inner = entry.class_sig.trim_start_matches('L').trim_end_matches(';');
+                                    inner.split('/').last().unwrap_or(inner).to_string()
+                                };
+                                let fn_label_full = format!("  {}.{}", short_class, readable);
+                                let fn_label = if fn_label_full.len() > 34 {
+                                    format!("{}…", &fn_label_full[..33])
+                                } else {
+                                    fn_label_full
+                                };
+                                let mut items: Vec<String> = vec![
+                                    fn_label,
+                                    "─────────────────────".into(),
+                                    "  Redirect: block   ".into(),
+                                    "  Redirect: true    ".into(),
+                                    "  Redirect: false   ".into(),
+                                    "  Redirect: 0       ".into(),
+                                    "─────────────────────".into(),
+                                    "  Copy address      ".into(),
+                                    "  Copy class sig    ".into(),
+                                    "─────────────────────".into(),
+                                    monitor_label.into(),
+                                ];
+                                if already_redirected {
+                                    items.insert(2, "  Restore original  ".into());
+                                }
+                                self.context_menu = Some(ContextMenu {
+                                    x: col,
+                                    y: row,
+                                    items,
+                                    selected: 0,
+                                    source: ContextMenuSource::JniMonitor,
+                                    line_idx: jni_idx,
+                                    click_col: 0,
+                                    keyboard_navigable: false,
+                                });
+                                self.focus = 0;
+                                self.command_focused = false;
+                            }
+                        }
+                        if !entry_menu {
+                            // Empty panel or header row — show monitor toggle only
+                            self.context_menu = Some(ContextMenu {
+                                x: col,
+                                y: row,
+                                items: vec![monitor_label.into()],
+                                selected: 0,
+                                source: ContextMenuSource::JniMonitor,
+                                line_idx: usize::MAX,
+                                click_col: 0,
+                                keyboard_navigable: false,
+                            });
+                            self.focus = 0;
+                            self.command_focused = false;
+                        }
+                    }
                     // Right-click in Locals panel (panel 1)
                     else if col > geom.locals_area.x && col < geom.locals_area.x + geom.locals_area.width.saturating_sub(1)
                         && row > geom.locals_area.y && row < geom.locals_area.y + geom.locals_area.height.saturating_sub(1)
@@ -2541,6 +2696,7 @@ impl App {
             ContextMenuSource::Tabbed => self.handle_tabbed_context_menu(item_idx, &menu),
             ContextMenuSource::PatchSubmenu => self.handle_patch_submenu(item_idx, &menu),
             ContextMenuSource::CommandInput => self.handle_command_context_menu(item_idx),
+            ContextMenuSource::JniMonitor => self.handle_jni_context_menu(item_idx, &menu),
         }
     }
 
@@ -2754,6 +2910,75 @@ impl App {
                         }
                     }
                 }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_jni_context_menu(&mut self, item_idx: usize, menu: &ContextMenu) {
+        let label = menu.items.get(item_idx).map(|s| s.trim()).unwrap_or("");
+
+        // Monitor toggle works even with no entry selected
+        match label {
+            "Start monitoring" => { self.do_jni_monitor_start(); return; }
+            "Stop monitoring"  => { self.do_jni_monitor_stop();  return; }
+            _ => {}
+        }
+
+        let entry = match self.jni_natives.get(menu.line_idx) {
+            Some(e) => e.clone(),
+            None => return,
+        };
+        let addr_str = if entry.lib_name.is_empty() || entry.lib_name == "[anon]" {
+            format!("0x{:x}", entry.native_addr as u64)
+        } else {
+            format!("{}+0x{:x}", entry.lib_name, entry.lib_offset as u64)
+        };
+
+        let label = menu.items.get(item_idx).map(|s| s.trim()).unwrap_or("");
+        match label {
+            // header / separators — no-op
+            l if l.starts_with('─') => {}
+            // entry function label — no-op (display only)
+            l if l.contains('.') && !l.starts_with("Redirect") && !l.starts_with("Restore")
+                && !l.starts_with("Copy") && !l.starts_with("Stop") && !l.starts_with("Start") => {}
+            "Restore original" => {
+                self.send_command(crate::protocol::OutboundCommand::JniRedirectClear {
+                    class_sig:   entry.class_sig.clone(),
+                    method_name: entry.method_name.clone(),
+                    method_sig:  entry.method_sig.clone(),
+                });
+            }
+            "Redirect: block" => {
+                self.do_jni_redirect_inner(
+                    entry.class_sig.clone(), entry.method_name.clone(), entry.method_sig.clone(),
+                    "block",
+                );
+            }
+            "Redirect: true" => {
+                self.do_jni_redirect_inner(
+                    entry.class_sig.clone(), entry.method_name.clone(), entry.method_sig.clone(),
+                    "true",
+                );
+            }
+            "Redirect: false" => {
+                self.do_jni_redirect_inner(
+                    entry.class_sig.clone(), entry.method_name.clone(), entry.method_sig.clone(),
+                    "false",
+                );
+            }
+            "Redirect: 0" => {
+                self.do_jni_redirect_inner(
+                    entry.class_sig.clone(), entry.method_name.clone(), entry.method_sig.clone(),
+                    "spoof 0",
+                );
+            }
+            "Copy address" => {
+                copy_to_clipboard(&addr_str);
+            }
+            "Copy class sig" => {
+                let sig = format!("{} {} {}", entry.class_sig, entry.method_name, entry.method_sig);
+                copy_to_clipboard(&sig);
             }
             _ => {}
         }
@@ -3232,10 +3457,12 @@ impl App {
                 self.log_scroll = apply_scroll(self.log_scroll, delta, self.log.len());
             } else if row < geom.hsplit_y {
                 if col < geom.vsplit_x {
-                    // Left panel (Bytecodes or Trace or AI)
+                    // Left panel (Bytecodes or Trace or AI or JNI)
                     if self.left_tab == LeftTab::Trace {
                         self.trace_auto_scroll = false;
                         self.trace_scroll = apply_scroll(self.trace_scroll, delta, self.call_records.len());
+                    } else if self.left_tab == LeftTab::JniMonitor {
+                        self.jni_monitor_scroll = apply_scroll(self.jni_monitor_scroll, delta, self.jni_natives.len());
                     } else if self.left_tab == LeftTab::Ai {
                         self.ai_auto_scroll = false;
                         self.ai_scroll = apply_scroll(self.ai_scroll, delta, self.ai_output.len());
@@ -3304,15 +3531,15 @@ impl App {
 
         match panel {
             0 => {
-                // Styled tabs: " Bytecodes  Decompiler  Trace   AI  "
-                // Each tab is " Name " with a space padding on each side
-                let names = &["Bytecodes", "Decompiler", "Trace", " AI "];
+                // Styled tabs: " Bytecodes  Decompiler  Trace   AI   JNI "
+                let names = &["Bytecodes", "Decompiler", "Trace", " AI ", "JNI"];
                 if let Some(idx) = find_styled_tab_click(rel, names) {
                     self.left_tab = match idx {
                         0 => LeftTab::Bytecodes,
                         1 => LeftTab::Decompiler,
                         2 => LeftTab::Trace,
-                        _ => LeftTab::Ai,
+                        3 => LeftTab::Ai,
+                        _ => LeftTab::JniMonitor,
                     };
                 }
             }
@@ -3885,6 +4112,7 @@ impl App {
             }
             KeyCode::Char('5') => {
                 match self.focus {
+                    0 => self.left_tab = LeftTab::JniMonitor,
                     2 => { self.tabbed_scroll = 0; self.right_tab = RightTab::Heap; }
                     _ => {}
                 }
@@ -3993,6 +4221,8 @@ impl App {
                 if self.left_tab == LeftTab::Trace {
                     self.trace_auto_scroll = false;
                     self.trace_scroll = apply_scroll(self.trace_scroll, delta, self.call_records.len());
+                } else if self.left_tab == LeftTab::JniMonitor {
+                    self.jni_monitor_scroll = apply_scroll(self.jni_monitor_scroll, delta, self.jni_natives.len());
                 } else if self.left_tab == LeftTab::Ai {
                     self.ai_auto_scroll = false;
                     self.ai_scroll = apply_scroll(self.ai_scroll, delta, self.ai_output.len());
@@ -4413,6 +4643,30 @@ impl App {
         }
         if input == "record stop" || input == "rec stop" {
             self.do_record_stop();
+            return;
+        }
+
+        // JNI monitor / redirect
+        if input == "jni monitor" || input == "jni start" {
+            self.do_jni_monitor_start();
+            return;
+        }
+        if input == "jni stop" || input == "jni unhook" {
+            self.do_jni_monitor_stop();
+            return;
+        }
+        if input == "jni clear" {
+            self.jni_natives.clear();
+            self.jni_monitor_scroll = 0;
+            self.log_info("JNI native list cleared");
+            return;
+        }
+        if let Some(rest) = input.strip_prefix("jni redirect ") {
+            self.do_jni_redirect(rest);
+            return;
+        }
+        if let Some(rest) = input.strip_prefix("jni restore ") {
+            self.do_jni_restore(rest);
             return;
         }
         if input == "record clear" || input == "rec clear" {
@@ -5470,6 +5724,22 @@ impl App {
         self.log_info("  rec onenter     - Toggle entry-only (no exit/return lines)");
         self.log_info("  rec flat        - Flat trace (no tree indentation)");
         self.log_info("  rec tree        - Tree trace (indented call tree)");
+        self.log_info("JNI monitor (key 5 -> JNI tab):");
+        self.log_info("  jni monitor     - Hook JNIEnv::RegisterNatives on all threads");
+        self.log_info("                    Captures: lib+offset, demangled Java signature");
+        self.log_info("  jni stop        - Stop monitoring, restore original vtable");
+        self.log_info("  jni clear       - Clear captured bindings list");
+        self.log_info("  jni redirect <class_sig> <method> <sig> <action>");
+        self.log_info("  jni redirect <lib+0xOFFSET|0xADDR> <action>  (address from JNI tab)");
+        self.log_info("    actions: block (return 0/null/false/void)");
+        self.log_info("             true  (return 1, for boolean methods)");
+        self.log_info("             spoof N (return integer N)");
+        self.log_info("    e.g.  jni redirect Lcom/guard/Shield; checkRoot ()Z block");
+        self.log_info("          jni redirect libnative.so+0x2c40 block");
+        self.log_info("          jni redirect 0x7f3a2b10 true");
+        self.log_info("  jni restore <class_sig> <method> <sig>");
+        self.log_info("  jni restore <lib+0xOFFSET|0xADDR>  (address from JNI tab)");
+        self.log_info("    Restore original function pointer (requires prior jni monitor capture)");
         self.log_info("  dex-dump        - Extract DEX from DexClassLoader (while suspended)");
         self.log_info("  dex-read <p>    - Read DEX/JAR file from device by path");
         self.log_info("  alias <sig> <label>  - Set display alias for a class");
@@ -6203,6 +6473,140 @@ impl App {
             return;
         }
         self.send_command(OutboundCommand::RecordStop {});
+    }
+
+    fn do_jni_monitor_start(&mut self) {
+        if self.state == AppState::Disconnected {
+            self.log_error("Not connected");
+            return;
+        }
+        if self.jni_monitoring {
+            self.log_error("JNI monitor already active");
+            return;
+        }
+        self.send_command(OutboundCommand::JniMonitorStart {});
+    }
+
+    fn do_jni_monitor_stop(&mut self) {
+        if !self.jni_monitoring {
+            self.log_error("JNI monitor not active");
+            return;
+        }
+        self.send_command(OutboundCommand::JniMonitorStop {});
+    }
+
+    /// Parse a native address string ("libnative.so+0x2c40" or "0x7f3a2b10") and
+    /// look it up in the captured jni_natives list.  Returns cloned (class_sig, method_name, method_sig).
+    fn resolve_jni_addr(&self, addr_str: &str) -> Option<(String, String, String)> {
+        // lib+offset form: "libnative.so+0x2c40"
+        if let Some(plus) = addr_str.find("+0x").or_else(|| addr_str.find("+0X")) {
+            let lib    = &addr_str[..plus];
+            let hex    = addr_str[plus + 1..].trim_start_matches("0x").trim_start_matches("0X");
+            if let Ok(offset) = u64::from_str_radix(hex, 16) {
+                return self.jni_natives.iter().find(|e| {
+                    e.lib_name == lib && e.lib_offset as u64 == offset
+                }).map(|e| (e.class_sig.clone(), e.method_name.clone(), e.method_sig.clone()));
+            }
+        }
+        // Absolute address form: "0x7f3a2b10"
+        if let Some(hex) = addr_str.strip_prefix("0x").or_else(|| addr_str.strip_prefix("0X")) {
+            if let Ok(addr) = u64::from_str_radix(hex, 16) {
+                return self.jni_natives.iter().find(|e| {
+                    e.native_addr as u64 == addr
+                }).map(|e| (e.class_sig.clone(), e.method_name.clone(), e.method_sig.clone()));
+            }
+        }
+        None
+    }
+
+    /// Returns true if the string looks like a native address rather than a class sig.
+    fn is_native_addr(s: &str) -> bool {
+        s.starts_with("0x") || s.starts_with("0X") || s.contains("+0x") || s.contains("+0X")
+    }
+
+    /// Parse and execute: jni redirect <class_sig> <method_name> <method_sig> <action>
+    ///                 or: jni redirect <lib+offset|0xADDR> <action>
+    fn do_jni_redirect(&mut self, args: &str) {
+        let parts: Vec<&str> = args.splitn(4, ' ').collect();
+
+        // Address-based shorthand: "libnative.so+0x2c40 block"
+        if parts.len() >= 2 && Self::is_native_addr(parts[0]) {
+            match self.resolve_jni_addr(parts[0]) {
+                Some((cs, mn, ms)) => {
+                    let action_part = parts[1..].join(" ");
+                    self.do_jni_redirect_inner(cs, mn, ms, &action_part);
+                }
+                None => self.log_error(&format!(
+                    "jni redirect: no captured binding for address {} — run 'jni monitor' first",
+                    parts[0]
+                )),
+            }
+            return;
+        }
+
+        // Full form: "Lcom/example/Shield; checkIntegrity ()Z block"
+        if parts.len() < 4 {
+            self.log_error("Usage: jni redirect <class_sig> <method_name> <method_sig> <block|true|false|spoof N>");
+            self.log_error("    or: jni redirect <lib+0xOFFSET|0xADDR> <action>  (address from JNI tab)");
+            return;
+        }
+        self.do_jni_redirect_inner(parts[0].to_string(), parts[1].to_string(),
+                                    parts[2].to_string(), parts[3]);
+    }
+
+    fn do_jni_redirect_inner(&mut self, class_sig: String, method_name: String,
+                              method_sig: String, action_str: &str) {
+        let (action, spoof_value) = if action_str.starts_with("spoof") {
+            let v = action_str.splitn(2, ' ').nth(1)
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(0);
+            ("spoof".to_string(), Some(v))
+        } else {
+            (action_str.to_string(), None)
+        };
+
+        // Store the intended action in our local entry before the agent confirms
+        if let Some(e) = self.jni_natives.iter_mut().find(|e| {
+            e.class_sig == class_sig && e.method_name == method_name && e.method_sig == method_sig
+        }) {
+            e.redirect_action = Some(action.clone());
+        }
+
+        self.send_command(OutboundCommand::JniRedirectSet {
+            class_sig, method_name, method_sig, action, spoof_value,
+        });
+    }
+
+    /// Parse and execute: jni restore <class_sig> <method_name> <method_sig>
+    ///                 or: jni restore <lib+offset|0xADDR>
+    fn do_jni_restore(&mut self, args: &str) {
+        let parts: Vec<&str> = args.splitn(3, ' ').collect();
+
+        // Address-based shorthand
+        if parts.len() == 1 && Self::is_native_addr(parts[0]) {
+            match self.resolve_jni_addr(parts[0]) {
+                Some((cs, mn, ms)) => {
+                    self.send_command(OutboundCommand::JniRedirectClear {
+                        class_sig: cs, method_name: mn, method_sig: ms,
+                    });
+                }
+                None => self.log_error(&format!(
+                    "jni restore: no captured binding for address {}",
+                    parts[0]
+                )),
+            }
+            return;
+        }
+
+        if parts.len() < 3 {
+            self.log_error("Usage: jni restore <class_sig> <method_name> <method_sig>");
+            return;
+        }
+        self.send_command(OutboundCommand::JniRedirectClear {
+            class_sig:   parts[0].to_string(),
+            method_name: parts[1].to_string(),
+            method_sig:  parts[2].to_string(),
+        });
     }
 
     fn toggle_trace_save(&mut self) {
