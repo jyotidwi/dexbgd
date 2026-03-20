@@ -209,6 +209,35 @@ fn draw_bytecodes(f: &mut Frame, app: &App, area: Rect, block: ratatui::widgets:
         if taken { Some(target) } else { None }
     });
 
+    // Viewport-wide branch pair colors: assign up to 5 distinct colors to unique branch targets
+    // visible in the current scroll window. Both the source (branch instruction) and destination
+    // lines get a matching colored dot in the gutter plus colored address tokens.
+    const BRANCH_PAIR_COLORS: [Color; 5] = [
+        Color::Rgb(80, 200, 190),   // teal
+        Color::Rgb(230, 150, 50),   // amber
+        Color::Rgb(170, 90, 210),   // purple
+        Color::Rgb(210, 90, 130),   // pink
+        Color::Rgb(130, 195, 70),   // lime
+    ];
+    // Collect offsets visible in the viewport so we can require both ends to be on-screen.
+    let viewport_offsets: std::collections::HashSet<u32> = app.bytecodes.iter()
+        .skip(scroll).take(code_height)
+        .map(|i| i.offset)
+        .collect();
+    let mut branch_target_colors: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+    for instr in app.bytecodes.iter().skip(scroll).take(code_height) {
+        if let Some(ref meta) = instr.branch {
+            // Only color the pair when the destination is also visible in the current view.
+            if viewport_offsets.contains(&meta.target)
+                && !branch_target_colors.contains_key(&meta.target)
+                && branch_target_colors.len() < 5
+            {
+                let len = branch_target_colors.len();
+                branch_target_colors.insert(meta.target, len);
+            }
+        }
+    }
+
     for (idx, instr) in app.bytecodes.iter().enumerate().skip(scroll).take(code_height) {
         let is_current = current_idx == Some(idx);
         let is_cursor = app.bytecodes_cursor == Some(idx);
@@ -258,6 +287,15 @@ fn draw_bytecodes(f: &mut Frame, app: &App, area: Rect, block: ratatui::widgets:
         } else {
             t.ui_bg
         };
+
+        // Branch pair colors for this instruction:
+        //   dest_pair_color - this instruction's offset IS a tracked branch target
+        //   src_pair_color  - this instruction IS a branch pointing to a tracked target
+        let dest_pair_color: Option<Color> = branch_target_colors.get(&instr.offset)
+            .map(|&idx| BRANCH_PAIR_COLORS[idx]);
+        let src_pair_color: Option<Color> = instr.branch.as_ref()
+            .and_then(|m| branch_target_colors.get(&m.target))
+            .map(|&idx| BRANCH_PAIR_COLORS[idx]);
 
         // Gutter style: red for breakpoint dot, otherwise matches marker
         let bp_gutter_style = if has_bp {
@@ -319,6 +357,14 @@ fn draw_bytecodes(f: &mut Frame, app: &App, area: Rect, block: ratatui::widgets:
             )
         };
 
+        // Override offset color for destination lines (this instruction IS a branch target).
+        // Applied after the semantic color block so pair color appears on non-special lines.
+        let offset_style = if let Some(c) = dest_pair_color {
+            Style::default().fg(c).bg(line_bg).add_modifier(Modifier::BOLD)
+        } else {
+            offset_style
+        };
+
         // For branch instructions on the current line, split text to highlight target offset
         if is_current && instr.branch.is_some() {
             if let Some((taken, target)) = branch_eval {
@@ -330,10 +376,15 @@ fn draw_bytecodes(f: &mut Frame, app: &App, area: Rect, block: ratatui::widgets:
                     let after = &instr.text[pos + target_str.len()..];
 
                     let target_fg = if taken { Color::Green } else { NOT_TAKEN_RED };
-                    let arrow = if taken { " \u{2192}" } else { " \u{2717}" }; // → or ✗
+                    let arrow = if target < instr.offset { " \u{2191}" } else { " \u{2193}" }; // up or down
                     let arrow_fg = if taken { Color::Green } else { NOT_TAKEN_RED };
 
+                    let pair_dot = match src_pair_color.or(dest_pair_color) {
+                        Some(c) => Span::styled("\u{25cf}", Style::default().fg(c).bg(line_bg)),
+                        None    => Span::styled(" ", Style::default().bg(line_bg)),
+                    };
                     let mut branch_spans = vec![
+                        pair_dot,
                         Span::styled(gutter.to_string(), bp_gutter_style),
                         Span::styled(offset_str, offset_style),
                         Span::styled(before, text_style),
@@ -362,7 +413,12 @@ fn draw_bytecodes(f: &mut Frame, app: &App, area: Rect, block: ratatui::widgets:
 
         // Use syntax coloring for instruction text
         let use_bold = is_current || is_branch_target;
+        let pair_dot = match src_pair_color.or(dest_pair_color) {
+            Some(c) => Span::styled("\u{25cf}", Style::default().fg(c).bg(line_bg)),
+            None    => Span::styled(" ", Style::default().bg(line_bg)),
+        };
         let mut line_spans = vec![
+            pair_dot,
             Span::styled(gutter.to_string(), bp_gutter_style),
             Span::styled(offset_str.to_string(), offset_style),
         ];
@@ -376,15 +432,28 @@ fn draw_bytecodes(f: &mut Frame, app: &App, area: Rect, block: ratatui::widgets:
             })
         });
         let display_text = apply_aliases(&instr.text, &app.aliases);
+        let mut colored = colorize_insn(&display_text, line_bg, use_bold, t);
         if followable && !is_current {
-            let mut colored = colorize_insn(&display_text, line_bg, use_bold, t);
             for span in &mut colored {
                 span.style = span.style.add_modifier(Modifier::UNDERLINED);
             }
-            line_spans.extend(colored);
-        } else {
-            line_spans.extend(colorize_insn(&display_text, line_bg, use_bold, t));
         }
+        // For non-current branch instructions: recolor the target token with the pair color
+        // so the source and destination visually share the same color tag.
+        if let Some(pair_c) = src_pair_color {
+            if !is_current {
+                if let Some(ref meta) = instr.branch {
+                    let target_str = format!("{:04x}", meta.target);
+                    for span in &mut colored {
+                        if span.content == target_str {
+                            span.style = span.style.fg(pair_c).add_modifier(Modifier::BOLD);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        line_spans.extend(colored);
 
         // Apply word highlight (click-to-highlight all occurrences)
         if let Some(ref hw) = app.bytecodes_highlight {
@@ -949,10 +1018,17 @@ fn classify_token(token: &str, t: &Theme) -> Color {
 
 /// Apply word-highlight to spans: any span whose trimmed content matches the
 /// highlight word gets the highlight background color.
+fn trim_punct(s: &str) -> &str {
+    s.trim_matches(|c: char| c == ',' || c == ' ' || c == ':')
+}
+
 fn apply_highlight(spans: &mut [Span<'_>], word: &str, highlight_bg: Color) {
+    // Trim punctuation from both sides so that clicking a branch target "005a" in an
+    // instruction also highlights the destination offset span "005a: ", and vice versa.
+    let word_trimmed = trim_punct(word);
     for span in spans.iter_mut() {
-        let content = span.content.trim_matches(|c: char| c == ',' || c == ' ');
-        if !content.is_empty() && content == word {
+        let content = trim_punct(&span.content);
+        if !content.is_empty() && content == word_trimmed {
             span.style = span.style.bg(highlight_bg);
         }
     }

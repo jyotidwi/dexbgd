@@ -3994,7 +3994,9 @@ impl App {
             }
             KeyCode::Backspace => {
                 if self.comment_cursor > 0 {
-                    self.comment_cursor -= 1;
+                    let prev_len = self.comment_input[..self.comment_cursor]
+                        .chars().next_back().map_or(1, |c| c.len_utf8());
+                    self.comment_cursor -= prev_len;
                     self.comment_input.remove(self.comment_cursor);
                 }
             }
@@ -4004,10 +4006,18 @@ impl App {
                 }
             }
             KeyCode::Left => {
-                if self.comment_cursor > 0 { self.comment_cursor -= 1; }
+                if self.comment_cursor > 0 {
+                    let prev_len = self.comment_input[..self.comment_cursor]
+                        .chars().next_back().map_or(1, |c| c.len_utf8());
+                    self.comment_cursor -= prev_len;
+                }
             }
             KeyCode::Right => {
-                if self.comment_cursor < self.comment_input.len() { self.comment_cursor += 1; }
+                if self.comment_cursor < self.comment_input.len() {
+                    let next_len = self.comment_input[self.comment_cursor..]
+                        .chars().next().map_or(1, |c| c.len_utf8());
+                    self.comment_cursor += next_len;
+                }
             }
             KeyCode::Home => { self.comment_cursor = 0; }
             KeyCode::End  => { self.comment_cursor = self.comment_input.len(); }
@@ -4068,7 +4078,9 @@ impl App {
             }
             KeyCode::Backspace => {
                 if self.comment_cursor > 0 {
-                    self.comment_cursor -= 1;
+                    let prev_len = self.comment_input[..self.comment_cursor]
+                        .chars().next_back().map_or(1, |c| c.len_utf8());
+                    self.comment_cursor -= prev_len;
                     self.comment_input.remove(self.comment_cursor);
                 }
             }
@@ -4077,8 +4089,20 @@ impl App {
                     self.comment_input.remove(self.comment_cursor);
                 }
             }
-            KeyCode::Left  => { if self.comment_cursor > 0 { self.comment_cursor -= 1; } }
-            KeyCode::Right => { if self.comment_cursor < self.comment_input.len() { self.comment_cursor += 1; } }
+            KeyCode::Left => {
+                if self.comment_cursor > 0 {
+                    let prev_len = self.comment_input[..self.comment_cursor]
+                        .chars().next_back().map_or(1, |c| c.len_utf8());
+                    self.comment_cursor -= prev_len;
+                }
+            }
+            KeyCode::Right => {
+                if self.comment_cursor < self.comment_input.len() {
+                    let next_len = self.comment_input[self.comment_cursor..]
+                        .chars().next().map_or(1, |c| c.len_utf8());
+                    self.comment_cursor += next_len;
+                }
+            }
             KeyCode::Home  => { self.comment_cursor = 0; }
             KeyCode::End   => { self.comment_cursor = self.comment_input.len(); }
             KeyCode::Char(c) if self.comment_input.len() < 64 => {
