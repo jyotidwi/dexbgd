@@ -398,6 +398,107 @@ fn scan_insns_for_const_string(
     }
 }
 
+/// Scan a DEX for all methods that contain an invoke of `target_class.target_method`.
+/// Returns deduplicated list of (class_name, method_name, proto) callers.
+/// Stops early and sets `timed_out` if scanning exceeds `timeout`.
+pub fn find_method_callers(
+    dex: &DexData,
+    target_class: &str,  // JNI form: "Landroid/os/Debug;"
+    target_method: &str, // "isDebuggerConnected"
+    timeout: std::time::Duration,
+) -> (Vec<(String, String, String)>, bool) {
+    let data = &dex.raw;
+    let start = std::time::Instant::now();
+    let mut seen = std::collections::HashSet::new();
+    let mut callers = Vec::new();
+
+    // We need class_defs to walk methods — re-parse the header
+    if data.len() < 112 { return (callers, false); }
+    let class_defs_size = read_u32(data, 96) as usize;
+    let class_defs_off  = read_u32(data, 100) as usize;
+
+    for i in 0..class_defs_size {
+        // Timeout checked per class — low overhead
+        if start.elapsed() > timeout {
+            return (callers, true);
+        }
+
+        let base = class_defs_off + i * 32;
+        if base + 32 > data.len() { break; }
+
+        let class_idx      = read_u32(data, base) as usize;
+        let class_data_off = read_u32(data, base + 24) as usize;
+        if class_data_off == 0 { continue; }
+
+        let class_name = dex.types.get(class_idx).cloned().unwrap_or_default();
+
+        let mut pos = class_data_off;
+        if pos >= data.len() { continue; }
+
+        let (static_fields,   n) = decode_uleb128(data, pos); pos += n;
+        let (instance_fields, n) = decode_uleb128(data, pos); pos += n;
+        let (direct_methods,  n) = decode_uleb128(data, pos); pos += n;
+        let (virtual_methods, n) = decode_uleb128(data, pos); pos += n;
+
+        for _ in 0..(static_fields + instance_fields) {
+            let (_, n) = decode_uleb128(data, pos); pos += n;
+            let (_, n) = decode_uleb128(data, pos); pos += n;
+        }
+
+        let mut method_idx_acc: u32 = 0;
+        for _ in 0..(direct_methods + virtual_methods) {
+            let (diff, n) = decode_uleb128(data, pos); pos += n;
+            let (_,    n) = decode_uleb128(data, pos); pos += n; // access_flags
+            let (code_off, n) = decode_uleb128(data, pos); pos += n;
+            method_idx_acc += diff;
+
+            if code_off == 0 { continue; }
+            let code_off = code_off as usize;
+            if code_off + 16 > data.len() { continue; }
+
+            let insns_size = read_u32(data, code_off + 12) as usize;
+            let insns_off  = code_off + 16;
+            if insns_off + insns_size * 2 > data.len() { continue; }
+
+            let mid = method_idx_acc as usize;
+            let (method_name, proto) = if let Some(m) = dex.methods.get(mid) {
+                (m.method_name.clone(), m.proto.clone())
+            } else {
+                continue;
+            };
+
+            // Scan instructions for invoke opcodes
+            let mut pc: usize = 0;
+            while pc < insns_size {
+                let byte_off = insns_off + pc * 2;
+                if byte_off + 1 >= data.len() { break; }
+                let opcode = data[byte_off];
+
+                // invoke-kind (35c): 0x6e–0x72, invoke-kind/range (3rc): 0x74–0x78
+                let is_invoke = matches!(opcode, 0x6e..=0x72 | 0x74..=0x78);
+                if is_invoke && byte_off + 4 <= data.len() {
+                    let ref_idx = read_u16(data, byte_off + 2) as usize;
+                    if let Some(m) = dex.methods.get(ref_idx) {
+                        if m.class_name == target_class && m.method_name == target_method {
+                            let key = (class_name.clone(), method_name.clone(), proto.clone());
+                            if seen.insert(key) {
+                                callers.push((class_name.clone(), method_name.clone(), proto.clone()));
+                            }
+                        }
+                    }
+                }
+
+                let width = if matches!(opcode, 0x6e..=0x72 | 0x74..=0x78) { 3 }
+                            else { dalvik_insn_width(opcode) as usize };
+                if width == 0 { break; }
+                pc += width;
+            }
+        }
+    }
+
+    (callers, false)
+}
+
 /// Return instruction width in 2-byte code units for a Dalvik opcode.
 fn dalvik_insn_width(opcode: u8) -> u32 {
     match opcode {

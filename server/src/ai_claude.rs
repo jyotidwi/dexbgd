@@ -290,6 +290,7 @@ You analyze Android apps by using the debugger's tools to inspect loaded classes
 4. Set breakpoints on crypto/network/exec APIs to catch runtime behavior
 5. Record API calls to build a behavioral profile
 6. Analyze call sequences for malicious patterns (C2 communication, data exfiltration, privilege escalation)
+7. Use xref to find anti-tamper strings ("su", "test-keys", "Superuser", "debuggable"), use dis to confirm the method, then anti to silently bypass. Prefer anti over bp+force_return for persistent silent interception.
 
 ## Output Format
 Structure your analysis with markdown headers (## Section).

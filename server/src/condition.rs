@@ -14,6 +14,18 @@ pub enum BreakpointAction {
 }
 
 pub const FORCE_RETURN_VOID: i32 = -1;
+/// Sentinel: auto-detect return value from method signature at hit time.
+pub const FORCE_RETURN_AUTO: i32 = -2;
+
+/// Pick a neutral return value based on the JNI method signature.
+/// Returns FORCE_RETURN_VOID for V, 0 (false/zero/null) for everything else.
+pub fn neutral_return_for_sig(sig: &str) -> i32 {
+    let ret_char = sig.find(')').and_then(|i| sig[i + 1..].chars().next());
+    match ret_char {
+        Some('V') => FORCE_RETURN_VOID,
+        _ => 0,
+    }
+}
 
 /// Parse an action string into a BreakpointAction.
 pub fn parse_action(s: &str) -> Option<BreakpointAction> {

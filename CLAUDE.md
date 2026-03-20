@@ -55,7 +55,7 @@ slot = GetMaxLocals(method) - GetArgumentsSize(method) + param_idx;
 - Delete `build/` when switching generators
 - `gradlew clean` when changing jniLibs
 - `useLegacyPackaging = true` in build.gradle
-- No unicode in user-facing strings (terminal rendering issues)
+- No unicode in user-facing strings (terminal rendering issues) — this means ALL log_info/log_error calls and any string rendered in the TUI. Use plain ASCII: `-` not `—`, `->` not `→`
 - Agent .so must be bundled in APK, not /data/local/tmp/ (SELinux)
 - Use bare library name for attach-agent (avoids base64 path truncation)
 

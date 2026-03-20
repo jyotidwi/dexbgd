@@ -107,6 +107,52 @@ fr 42           getRetryCount() -> 42. Why not.
 
 After forcing the return, execution pauses at the caller's next instruction so you can see the effect before continuing.
 
+### Silent anti-tamper bypass (`anti`)
+
+`bypass-ssl` silently intercepts SSL pinning. `anti` does the same for any method — it sets a ghost breakpoint that auto-ForceEarlyReturns a neutral value without pausing or showing anything to the user.
+
+Three ways to find what to hook:
+
+```
+// Direct: name the method
+anti com.example.Security isRooted
+
+// xref: find methods that load a suspicious string constant
+anti xref su
+anti xref test-keys
+anti xref Superuser
+
+// callers: find methods that invoke a specific API
+anti callers android.os.Debug isDebuggerConnected
+```
+
+Example against the test app on a rooted device:
+
+```
+> attach com.test.profiletest
+  [press Detect button -> "Root: DETECTED (1)"]
+
+> anti xref su
+  anti xref "su": 1 unique method(s) - setting anti hooks...
+    MainActivity.testDetect ("/system/xbin/su")
+
+  [press Detect button -> "Root: not detected (0)"]
+  [anti] MainActivity.testDetect()I -> 0/false/null
+
+> anti list
+  1 active anti hook(s):
+    #3 MainActivity.testDetect
+
+> anti clear
+```
+
+Return value is auto-detected from the JNI signature (`Z/B/I/...` -> `false`/`0`, `V` -> `void`). Override with an explicit value:
+
+```
+anti com.example.License check true      // always pass
+anti com.example.Integrity verify void   // silently swallow
+```
+
 ### Dynamic DEX interception
 
 When `bp-exec` is active and the app loads code at runtime (DexClassLoader, InMemoryDexClassLoader), dexbgd automatically:
@@ -271,6 +317,10 @@ patch <cls> <m> void|true|false|null|0|1   Replace method body
 patch <cls> <m> @0xOFFSET nop              Nop single instruction
 nop-range 0xOFFSET                         Nop from current PC to offset (takes effect at next entry)
 bypass-ssl                                 Auto-bypass SSL pinning (NSC, Conscrypt, OkHttp)
+anti <cls> <m> [val]                       Silent ghost BP: ForceReturn neutral value on hit
+anti xref <pattern>                        Same, auto-discover via string xref
+anti callers <cls> <m>                     Same, auto-discover by scanning invoke instructions
+anti list / anti clear                     Manage active anti hooks
 ```
 
 Class accepts simple name, dot-notation, or full JNI descriptor:

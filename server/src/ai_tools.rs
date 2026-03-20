@@ -249,6 +249,20 @@ pub fn all_tools() -> Vec<ToolDef> {
             parameters: json!({ "type": "object", "properties": {} }),
             is_execution: true,
         },
+        ToolDef {
+            name: "anti",
+            description: "Set a silent ghost breakpoint that auto-ForceEarlyReturns with a neutral value on hit. Use to bypass root detection, debuggable checks, integrity checks, license checks. Prefer over bp+force_return for persistent silent interception. Modes: (1) anti <class> <method> [value] — direct hook; (2) anti xref <pattern> — hook all methods referencing a string constant; (3) anti callers <class> <method> — hook all methods that invoke the given API (use sparingly on broad APIs).",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "class": { "type": "string", "description": "Class name (e.g. 'com.test.profiletest.MainActivity'), or 'xref' for string pattern mode, or 'callers' for caller-scan mode" },
+                    "method": { "type": "string", "description": "Method name; or xref pattern when class='xref' (e.g. 'su'); or 'TargetClass method' when class='callers' (e.g. 'android.os.Debug isDebuggerConnected')" },
+                    "value": { "type": "string", "description": "Optional return value: false/true/void/N (default: auto-detect from signature). Direct mode only." }
+                },
+                "required": ["class", "method"]
+            }),
+            is_execution: true,
+        },
     ]
 }
 

@@ -481,6 +481,10 @@ pub struct App {
     pub pending_bypass_count: usize,
     /// True while bypass-ssl is active — enables SSLContext.init TrustManager inspection.
     pub bypass_ssl_active: bool,
+    /// BP IDs that should silently ForceEarlyReturn with a neutral value on hit.
+    pub anti_bps: HashSet<i32>,
+    /// Number of pending BpSetOk confirmations to absorb into anti_bps.
+    pub pending_anti_count: usize,
 
     // Per-app session state (loaded on connect, saved with Ctrl+S)
     /// Package name of the connected app (from /proc/self/cmdline).
@@ -668,6 +672,8 @@ impl App {
             bypass_ssl_bps: HashSet::new(),
             pending_bypass_count: 0,
             bypass_ssl_active: false,
+            anti_bps: HashSet::new(),
+            pending_anti_count: 0,
             current_package: None,
             aliases: HashMap::new(),
             hooks: Vec::new(),
@@ -1027,6 +1033,11 @@ impl App {
                     self.bypass_ssl_bps.insert(id);
                     self.pending_bypass_count -= 1;
                 }
+                // Absorb into anti set if anti is pending
+                if self.pending_anti_count > 0 {
+                    self.anti_bps.insert(id);
+                    self.pending_anti_count -= 1;
+                }
                 let cls = short_class(&class);
                 let was_deferred = self.bp_manager.update_or_add(BreakpointEntry {
                     id,
@@ -1075,6 +1086,7 @@ impl App {
             AgentMessage::BpClearOk { id } => {
                 self.log_info(&format!("Breakpoint #{} cleared", id));
                 self.bp_manager.remove(id);
+                self.anti_bps.remove(&id);
             }
 
             AgentMessage::BpDeferred { id, class, method } => {
@@ -1104,7 +1116,7 @@ impl App {
                 }
             }
 
-            AgentMessage::BpHit { bp_id, class, method, sig: _, location, line } => {
+            AgentMessage::BpHit { bp_id, class, method, sig, location, line } => {
                 self.stepping_quiet = false;
                 // Auto-bypass SSL breakpoints — force return void + continue, no pause
                 if self.bypass_ssl_bps.contains(&bp_id) {
@@ -1114,11 +1126,28 @@ impl App {
                     self.send_command(OutboundCommand::Continue {});
                     return;
                 }
+                // Anti hooks — silent ghost breakpoint, ForceEarlyReturn neutral value
+                if self.anti_bps.contains(&bp_id) {
+                    let retval = match self.bp_manager.get_condition(bp_id).and_then(|c| c.action.clone()) {
+                        Some(condition::BreakpointAction::ForceReturn(v)) if v == condition::FORCE_RETURN_AUTO =>
+                            condition::neutral_return_for_sig(&sig),
+                        Some(condition::BreakpointAction::ForceReturn(v)) => v,
+                        _ => condition::neutral_return_for_sig(&sig),
+                    };
+                    let label = if retval == condition::FORCE_RETURN_VOID { "void" } else { "0/false/null" };
+                    let cls = short_class(&class);
+                    self.log_info(&format!("[anti] {}.{}{} -> {}", cls, method, sig, label));
+                    self.send_command(OutboundCommand::ForceReturn {
+                        return_value: if retval == condition::FORCE_RETURN_VOID { 0 } else { retval },
+                    });
+                    self.send_command(OutboundCommand::Continue {});
+                    return;
+                }
                 // SSLContext.init interception — inspect TrustManager[] to find obfuscated TM class
                 if self.bypass_ssl_active && method == "init"
                     && class == "Ljavax/net/ssl/SSLContext;"
                 {
-                    self.log_info("[bypass-ssl] SSLContext.init hit — inspecting TrustManager[]...");
+                    self.log_info("[bypass-ssl] SSLContext.init hit - inspecting TrustManager[]...");
                     self.send_command(OutboundCommand::SslGetTmClasses {});
                     return;
                 }
@@ -1572,7 +1601,7 @@ impl App {
             AgentMessage::JniMonitorStarted {} => {
                 self.jni_monitoring = true;
                 self.left_tab = LeftTab::JniMonitor;
-                self.log_info("JNI monitor started — watching RegisterNatives");
+                self.log_info("JNI monitor started - watching RegisterNatives");
             }
 
             AgentMessage::JniMonitorStopped { count } => {
@@ -1647,6 +1676,9 @@ impl App {
                     } else if !self.pending_bp_conditions.is_empty() {
                         self.pending_bp_conditions.pop_front();
                     }
+                    if self.pending_anti_count > 0 {
+                        self.pending_anti_count -= 1;
+                    }
                 }
                 // If waiting for condition eval and got an error (e.g. locals/regs failed),
                 // mark as received so we can still evaluate with whatever data we have
@@ -1661,7 +1693,7 @@ impl App {
 
             AgentMessage::TmClasses { classes } => {
                 if classes.is_empty() {
-                    self.log_info("[bypass-ssl] SSLContext.init: TrustManager[] is null/empty (system default — no custom pinning here)");
+                    self.log_info("[bypass-ssl] SSLContext.init: TrustManager[] is null/empty (system default - no custom pinning here)");
                 } else {
                     let mut patched = 0;
                     for class_sig in &classes {
@@ -1669,7 +1701,7 @@ impl App {
                         if class_sig.contains("conscrypt") || class_sig.contains("NetworkSecurity") {
                             continue;
                         }
-                        self.log_info(&format!("[bypass-ssl] Found TrustManager: {} — patching checkServerTrusted...", class_sig));
+                        self.log_info(&format!("[bypass-ssl] Found TrustManager: {} - patching checkServerTrusted...", class_sig));
                         let args = format!("{} checkServerTrusted void", class_sig);
                         self.do_patch(&args);
                         patched += 1;
@@ -4781,6 +4813,11 @@ impl App {
             return;
         }
 
+        if input.starts_with("anti") || input.starts_with("bypass-anti") {
+            self.do_anti(input);
+            return;
+        }
+
         // Breakpoint profiles (may have trailing condition flags)
         if input.starts_with("bp-") {
             self.do_bp_profile(input);
@@ -5422,6 +5459,8 @@ impl App {
         self.pending_cond_eval = None;
         self.pending_bp_resolve = None;
         self.cls_auto_pending = false;
+        self.anti_bps.clear();
+        self.pending_anti_count = 0;
         self.threads.clear();
         self.log_info("Disconnected");
     }
@@ -5836,6 +5875,12 @@ impl App {
         self.log_info("  bp-detect       - Set breakpoints on root/tamper detection APIs");
         self.log_info("  bp-ssl          - Set breakpoints on SSL/TLS pinning APIs");
         self.log_info("  bypass-ssl      - Auto-bypass SSL pinning (silent force-return void)");
+        self.log_info("  anti <cls> <m>  - Silent ghost BP: ForceReturn neutral value on hit");
+        self.log_info("  anti <cls> <m> <val>  - Same, explicit value (true/false/void/N)");
+        self.log_info("  anti xref <pat>       - xref pattern, anti-hook all matching methods");
+        self.log_info("  anti callers <cls> <m> - anti-hook all methods that invoke <cls>.<m>");
+        self.log_info("  anti list       - Show active anti hooks");
+        self.log_info("  anti clear      - Remove all anti hooks");
         self.log_info("  bp-all          - Set all API breakpoints");
         self.log_info("  record / rec    - Toggle call recording on/off");
         self.log_info("  rec start/stop  - Start/stop recording");
@@ -6368,6 +6413,8 @@ impl App {
         self.pending_bp_cond = None;
         self.pending_bp_conditions.clear();
         self.pending_cond_eval = None;
+        self.anti_bps.clear();
+        self.pending_anti_count = 0;
         let ids: Vec<i32> = self.bp_manager.breakpoints.iter().map(|bp| bp.id).collect();
         if ids.is_empty() {
             self.log_info("No breakpoints to clear.");
@@ -6567,7 +6614,253 @@ impl App {
             location: None,
         });
         self.bypass_ssl_active = true;
-        self.log_info("bypass-ssl: active — SSL pin checks will be silently bypassed");
+        self.log_info("bypass-ssl: active - SSL pin checks will be silently bypassed");
+    }
+
+    // -------------------------------------------------------------------
+    // Anti-tamper bypass
+    // -------------------------------------------------------------------
+
+    fn do_anti(&mut self, input: &str) {
+        let rest = if input.starts_with("bypass-anti") {
+            input["bypass-anti".len()..].trim()
+        } else {
+            input["anti".len()..].trim()
+        };
+
+        match rest {
+            "list" => {
+                if self.anti_bps.is_empty() {
+                    self.log_info("No active anti hooks.");
+                } else {
+                    let lines: Vec<String> = self.anti_bps.iter().map(|id| {
+                        if let Some(bp) = self.bp_manager.breakpoints.iter().find(|b| b.id == *id) {
+                            format!("  #{} {}.{}", bp.id, short_class(&bp.class), bp.method)
+                        } else {
+                            format!("  #{}", id)
+                        }
+                    }).collect();
+                    self.log_info(&format!("{} active anti hook(s):", lines.len()));
+                    for line in lines {
+                        self.log_info(&line);
+                    }
+                }
+                return;
+            }
+            "clear" => {
+                let ids: Vec<i32> = self.anti_bps.iter().cloned().collect();
+                if ids.is_empty() {
+                    self.log_info("No anti hooks to clear.");
+                    return;
+                }
+                self.log_info(&format!("Clearing {} anti hook(s)...", ids.len()));
+                for id in ids {
+                    self.send_command(OutboundCommand::BpClear { id });
+                }
+                return;
+            }
+            _ => {}
+        }
+
+        if rest.starts_with("xref ") {
+            let pattern = rest["xref ".len()..].trim();
+            self.do_anti_xref(pattern);
+            return;
+        }
+
+        if rest.starts_with("callers ") {
+            let args = rest["callers ".len()..].trim();
+            self.do_anti_callers(args);
+            return;
+        }
+
+        if self.state == AppState::Disconnected {
+            self.log_error("Not connected. Use 'connect' first.");
+            return;
+        }
+
+        // Parse: <class> <method> [retval]
+        let parts: Vec<&str> = rest.splitn(3, ' ').collect();
+        if parts.len() < 2 || parts[0].is_empty() || parts[1].is_empty() {
+            self.log_error("Usage: anti <class> <method> [true|false|void|<N>]");
+            return;
+        }
+
+        let class = parts[0];
+        let method = parts[1];
+        let retval = if parts.len() >= 3 {
+            match parts[2].trim() {
+                "void" | "frv" => condition::FORCE_RETURN_VOID,
+                "true" | "1" => 1,
+                "false" | "0" => 0,
+                s => s.parse::<i32>().unwrap_or(0),
+            }
+        } else {
+            condition::FORCE_RETURN_AUTO
+        };
+
+        let class_jni = commands::to_jni_sig(class);
+        let label = if retval == condition::FORCE_RETURN_AUTO {
+            "auto".to_string()
+        } else if retval == condition::FORCE_RETURN_VOID {
+            "void".to_string()
+        } else {
+            retval.to_string()
+        };
+        self.log_info(&format!("anti: hooking {}.{} -> {}", short_class(&class_jni), method, label));
+
+        self.pending_bp_conditions.push_back(
+            condition::BreakpointCondition::for_action(condition::BreakpointAction::ForceReturn(retval))
+        );
+        self.pending_anti_count += 1;
+        self.send_command(OutboundCommand::BpSet {
+            class: class_jni,
+            method: method.to_string(),
+            sig: None,
+            location: None,
+        });
+    }
+
+    fn do_anti_xref(&mut self, pattern: &str) {
+        if pattern.is_empty() {
+            self.log_error("usage: anti xref <pattern>");
+            return;
+        }
+        if self.dex_data.is_empty() {
+            self.log_error("No DEX loaded. Use 'apk <package>' first.");
+            return;
+        }
+        if self.state == AppState::Disconnected {
+            self.log_error("Not connected. Use 'connect' first.");
+            return;
+        }
+
+        let pat = pattern.to_lowercase();
+        const MAX_RESULTS: usize = 100;
+        let multi_dex = self.dex_data.len() > 1;
+
+        // Collect matching xrefs, deduplicated by (class, method, proto)
+        let mut seen = std::collections::HashSet::new();
+        let mut hits: Vec<(String, String, String, String)> = Vec::new(); // (display, class, method, proto)
+
+        'outer: for (dex_idx, dex) in self.dex_data.iter().enumerate() {
+            for xref in &dex.string_xrefs {
+                if let Some(s) = dex.strings.get(xref.string_idx as usize) {
+                    if s.to_lowercase().contains(&pat) {
+                        let key = (xref.class_name.clone(), xref.method_name.clone(), xref.proto.clone());
+                        if seen.insert(key) {
+                            let label = self.dex_labels.get(dex_idx).map(|l| l.as_str()).unwrap_or("?");
+                            let prefix = if multi_dex { format!("[{}] ", label) } else { String::new() };
+                            let display_str = if s.len() > 60 { format!("{}...", &s[..60]) } else { s.clone() };
+                            hits.push((
+                                format!("  {}{}.{} (\"{}\")", prefix, short_class(&xref.class_name), xref.method_name, display_str),
+                                xref.class_name.clone(),
+                                xref.method_name.clone(),
+                                xref.proto.clone(),
+                            ));
+                            if hits.len() >= MAX_RESULTS { break 'outer; }
+                        }
+                    }
+                }
+            }
+        }
+
+        if hits.is_empty() {
+            self.log_info(&format!("anti xref \"{}\": no references found", pattern));
+            return;
+        }
+
+        let hit_count = hits.len();
+        let truncated = hit_count >= MAX_RESULTS;
+        self.log_info(&format!("anti xref \"{}\": {} unique method(s) - setting anti hooks...", pattern, hit_count));
+        for (display, class_name, method_name, proto) in hits {
+            self.log_info(&display);
+            self.pending_bp_conditions.push_back(
+                condition::BreakpointCondition::for_action(condition::BreakpointAction::ForceReturn(condition::FORCE_RETURN_AUTO))
+            );
+            self.pending_anti_count += 1;
+            self.send_command(OutboundCommand::BpSet {
+                class: class_name,
+                method: method_name,
+                sig: Some(proto),
+                location: None,
+            });
+        }
+
+        if truncated {
+            self.log_info(&format!("  ... (truncated at {} results)", MAX_RESULTS));
+        }
+    }
+
+    fn do_anti_callers(&mut self, args: &str) {
+        let parts: Vec<&str> = args.splitn(2, ' ').collect();
+        if parts.len() < 2 || parts[0].is_empty() || parts[1].is_empty() {
+            self.log_error("usage: anti callers <class> <method>");
+            return;
+        }
+        if self.dex_data.is_empty() {
+            self.log_error("No DEX loaded. Use 'apk <package>' first.");
+            return;
+        }
+        if self.state == AppState::Disconnected {
+            self.log_error("Not connected. Use 'connect' first.");
+            return;
+        }
+
+        let target_class_jni = commands::to_jni_sig(parts[0]);
+        let target_method = parts[1].to_string();
+        let timeout = std::time::Duration::from_secs(3);
+        const BROAD_API_THRESHOLD: usize = 5;
+
+        let mut all_callers: Vec<(String, String, String)> = Vec::new();
+        let mut timed_out = false;
+        let mut seen: std::collections::HashSet<(String, String, String)> = std::collections::HashSet::new();
+
+        for dex in &self.dex_data {
+            let (callers, did_timeout) = crate::dex_parser::find_method_callers(dex, &target_class_jni, &target_method, timeout);
+            for (cls, meth, proto) in callers {
+                if seen.insert((cls.clone(), meth.clone(), proto.clone())) {
+                    all_callers.push((cls, meth, proto));
+                }
+            }
+            if did_timeout {
+                timed_out = true;
+                break;
+            }
+        }
+
+        if timed_out {
+            self.log_error("anti callers: scan timed out (3s) - DEX too large. Results so far:");
+        }
+
+        if all_callers.is_empty() {
+            self.log_info(&format!("anti callers {}.{}: no callers found", short_class(&target_class_jni), target_method));
+            return;
+        }
+
+        if all_callers.len() > BROAD_API_THRESHOLD {
+            self.log_info(&format!(
+                "anti callers: WARNING — {} callers found for {}.{}. This is a broad API; anti-hooking all callers may break legitimate app behaviour.",
+                all_callers.len(), short_class(&target_class_jni), target_method
+            ));
+        }
+
+        self.log_info(&format!("anti callers {}.{}: {} caller(s) - setting anti hooks...",
+            short_class(&target_class_jni), target_method, all_callers.len()));
+
+        for (class_name, method_name, proto) in all_callers {
+            self.log_info(&format!("  {}.{}", short_class(&class_name), method_name));
+            self.pending_bp_conditions.push_back(
+                condition::BreakpointCondition::for_action(condition::BreakpointAction::ForceReturn(condition::FORCE_RETURN_AUTO))
+            );
+            self.pending_anti_count += 1;
+            self.send_command(OutboundCommand::BpSet {
+                class: class_name,
+                method: method_name,
+                sig: Some(proto),
+                location: None,
+            });
+        }
     }
 
     // -------------------------------------------------------------------
@@ -7333,6 +7626,15 @@ impl App {
             }
             "record_stop" => {
                 self.execute_tool_as_command("record stop")
+            }
+            "anti" => {
+                let class = input.get("class").and_then(|v| v.as_str()).unwrap_or("");
+                let method = input.get("method").and_then(|v| v.as_str()).unwrap_or("");
+                let mut cmd = format!("anti {} {}", class, method);
+                if let Some(v) = input.get("value").and_then(|v| v.as_str()) {
+                    cmd.push_str(&format!(" {}", v));
+                }
+                self.execute_tool_as_command(&cmd)
             }
             _ => format!("Unknown tool: {}", name),
         }
