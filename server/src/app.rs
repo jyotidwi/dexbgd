@@ -4897,6 +4897,29 @@ impl App {
             return;
         }
 
+        // Expand "bp here" / "break here" to "bp <class> <method> @<offset>"
+        let input_owned;
+        let input = if (input.starts_with("bp ") || input.starts_with("break "))
+            && input.splitn(2, ' ').nth(1).unwrap_or("").trim() == "here"
+        {
+            match (&self.current_class.clone(), &self.current_method.clone()) {
+                (Some(cls), Some(method)) => {
+                    let offset = self.bytecodes_cursor
+                        .and_then(|i| self.bytecodes.get(i))
+                        .map(|instr| format!(" @0x{:04x}", instr.offset))
+                        .unwrap_or_default();
+                    input_owned = format!("bp {} {}{}", cls, method, offset);
+                    input_owned.as_str()
+                }
+                _ => {
+                    self.log_error("Not stopped in any method");
+                    return;
+                }
+            }
+        } else {
+            input
+        };
+
         if input.starts_with("bp ") || input.starts_with("break ") {
             let args = input.splitn(2, ' ').nth(1).unwrap_or("").trim();
             match condition::parse_condition_flags(args) {
@@ -4973,16 +4996,18 @@ impl App {
             }
         }
 
-        // wai - where am i? print current class.method in JADX dot notation
-        if input == "wai" {
-            match (&self.current_class, &self.current_method) {
+        // here - print current class.method [@offset] in JADX dot notation
+        if input == "here" {
+            match (&self.current_class.clone(), &self.current_method.clone()) {
                 (Some(cls), Some(method)) => {
-                    // Convert JNI sig "Lsg/vantagepoint/a;" -> "sg.vantagepoint.a"
                     let dot = cls
                         .strip_prefix('L').unwrap_or(cls)
                         .strip_suffix(';').unwrap_or(cls)
                         .replace('/', ".");
-                    self.log_info(&format!("{}.{}", dot, method));
+                    let loc = self.bytecodes_cursor
+                        .and_then(|i| self.bytecodes.get(i))
+                        .map(|instr| format!(" {:03x}", instr.offset));
+                    self.log_info(&format!("{}.{}{}", dot, method, loc.unwrap_or_default()));
                 }
                 _ => self.log_info("Not stopped in any method"),
             }
@@ -5943,7 +5968,7 @@ impl App {
         self.log_info("  r / regs        - Dump all register values to log");
         self.log_info("  r v4            - Read register v4 to log");
         self.log_info("  r <name>        - Read local variable by name to log");
-        self.log_info("  wai             - Where am I? Print current class.method (JADX notation)");
+        self.log_info("  here            - Print current class.method [@offset] (JADX notation); use in 'bp here'");
         self.log_info("  stack           - Show call stack");
         self.log_info("  inspect <slot>  - Inspect object at slot (e.g. inspect 3 or inspect v3)");
         self.log_info("  eval <expr>     - Eval: v3.getAlgorithm(), v5.length");

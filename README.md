@@ -425,6 +425,8 @@ ai cancel           Cancel running AI analysis
 
 ### Misc
 ```
+here                Print current class.method [@offset] (JADX notation)
+                    Use in: bp here  (set breakpoint at cursor instruction)
 save [file]         Save log to file
 ss / save settings  Save settings to disk (theme, panel layout, history)
 help / ?            Show command reference
