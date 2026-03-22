@@ -268,6 +268,29 @@ pub enum AgentMessage {
         method_sig: String,
     },
 
+    #[serde(rename = "wp_set_ok")]
+    WpSetOk { id: i32, field: String, class: String },
+
+    #[serde(rename = "wp_clear_ok")]
+    WpClearOk { id: i32 },
+
+    #[serde(rename = "watchpoint_hit")]
+    WatchpointHit {
+        wp_id:        i32,
+        field:        String,
+        class:        String,
+        access:       String,
+        #[serde(default)]
+        new_value:    Option<String>,
+        thread:       String,
+        method:       String,
+        method_class: String,
+        location:     i64,
+    },
+
+    #[serde(rename = "wp_list")]
+    WpList { watchpoints: serde_json::Value },
+
     #[serde(rename = "error")]
     Error { msg: String },
 
@@ -586,4 +609,18 @@ pub enum OutboundCommand {
         method_name: String,
         method_sig: String,
     },
+
+    #[serde(rename = "set_watchpoint")]
+    SetWatchpoint {
+        class_sig:  String,
+        field_name: String,
+        on_read:    bool,
+        on_write:   bool,
+    },
+
+    #[serde(rename = "clear_watchpoint")]
+    ClearWatchpoint { id: i32 },
+
+    #[serde(rename = "list_watchpoints")]
+    ListWatchpoints {},
 }

@@ -1128,6 +1128,179 @@ static void JNICALL OnVMDeath(jvmtiEnv* jvmti, JNIEnv* jni) {
 // Capabilities and setup
 // ---------------------------------------------------------------------------
 
+// Callback: field modification (watchpoint write) — fires when a watched field is written.
+static void JNICALL OnFieldModification(
+        jvmtiEnv* jvmti,
+        JNIEnv* jni,
+        jthread thread,
+        jmethodID method,
+        jlocation location,
+        jclass field_klass,
+        jobject object,
+        jfieldID field,
+        char signature_type,
+        jvalue new_value) {
+    (void)object;
+
+    DebuggerState* dbg = GetDebuggerState();
+    (void)dbg;
+
+    // Find matching watchpoint
+    pthread_mutex_lock(&dbg->wp_mutex);
+    int wp_id = -1;
+    char wp_class_sig[256] = "?";
+    char wp_field_name[128] = "?";
+    for (auto& wp : dbg->watchpoints) {
+        if (wp.on_write && wp.field_id == field &&
+                jni->IsSameObject(field_klass, wp.klass)) {
+            wp_id = wp.id;
+            strncpy(wp_class_sig, wp.class_sig, sizeof(wp_class_sig) - 1);
+            strncpy(wp_field_name, wp.field_name, sizeof(wp_field_name) - 1);
+            break;
+        }
+    }
+    pthread_mutex_unlock(&dbg->wp_mutex);
+
+    // Format new value
+    char val_str[512] = "";
+    switch (signature_type) {
+        case 'Z': snprintf(val_str, sizeof(val_str), "%s", new_value.z ? "true" : "false"); break;
+        case 'B': snprintf(val_str, sizeof(val_str), "%d", (int)new_value.b); break;
+        case 'S': snprintf(val_str, sizeof(val_str), "%d", (int)new_value.s); break;
+        case 'C': snprintf(val_str, sizeof(val_str), "%d", (int)new_value.c); break;
+        case 'I': snprintf(val_str, sizeof(val_str), "%d", (int)new_value.i); break;
+        case 'J': snprintf(val_str, sizeof(val_str), "%lld", (long long)new_value.j); break;
+        case 'F': snprintf(val_str, sizeof(val_str), "%g", (double)new_value.f); break;
+        case 'D': snprintf(val_str, sizeof(val_str), "%g", new_value.d); break;
+        case 'L': case '[':
+            if (new_value.l) {
+                FormatObjectValue(jni, new_value.l, val_str, sizeof(val_str), false);
+            } else {
+                snprintf(val_str, sizeof(val_str), "null");
+            }
+            break;
+        default: snprintf(val_str, sizeof(val_str), "?"); break;
+    }
+
+    // Get thread name
+    jvmtiThreadInfo tinfo;
+    memset(&tinfo, 0, sizeof(tinfo));
+    jvmti->GetThreadInfo(thread, &tinfo);
+    const char* tname = tinfo.name ? tinfo.name : "?";
+
+    // Get method info
+    char* mclass_sig = nullptr;
+    char* mname = nullptr;
+    char* msig = nullptr;
+    jclass mdecl = nullptr;
+    if (jvmti->GetMethodDeclaringClass(method, &mdecl) == JVMTI_ERROR_NONE && mdecl) {
+        jvmti->GetClassSignature(mdecl, &mclass_sig, nullptr);
+    }
+    jvmti->GetMethodName(method, &mname, &msig, nullptr);
+
+    ALOGI("[DBG] Watchpoint #%d write: %s.%s = %s at %s.%s+%lld thread:%s",
+          wp_id, wp_class_sig, wp_field_name, val_str,
+          mclass_sig ? mclass_sig : "?", mname ? mname : "?",
+          (long long)location, tname);
+
+    JsonBuf jb;
+    json_start(&jb);
+    json_add_string(&jb, "type", "watchpoint_hit");
+    json_add_int(&jb, "wp_id", wp_id);
+    json_add_string(&jb, "field", wp_field_name);
+    json_add_string(&jb, "class", wp_class_sig);
+    json_add_string(&jb, "access", "write");
+    json_add_string(&jb, "new_value", val_str);
+    json_add_string(&jb, "thread", tname);
+    json_add_string(&jb, "method", mname ? mname : "?");
+    json_add_string(&jb, "method_class", mclass_sig ? mclass_sig : "?");
+    json_add_long(&jb, "location", (long long)location);
+    json_end(&jb);
+    SendToClient(jb.buf);
+
+    if (tinfo.name) jvmti->Deallocate(reinterpret_cast<unsigned char*>(tinfo.name));
+    if (mclass_sig) jvmti->Deallocate(reinterpret_cast<unsigned char*>(mclass_sig));
+    if (mname) jvmti->Deallocate(reinterpret_cast<unsigned char*>(mname));
+    if (msig) jvmti->Deallocate(reinterpret_cast<unsigned char*>(msig));
+    if (mdecl) jni->DeleteLocalRef(mdecl);
+
+    DebuggerCommandLoop(jvmti, jni, thread, method, location, -1);
+}
+
+// Callback: field access (watchpoint read) — fires when a watched field is read.
+static void JNICALL OnFieldAccess(
+        jvmtiEnv* jvmti,
+        JNIEnv* jni,
+        jthread thread,
+        jmethodID method,
+        jlocation location,
+        jclass field_klass,
+        jobject object,
+        jfieldID field) {
+    (void)object;
+
+    DebuggerState* dbg = GetDebuggerState();
+
+    // Find matching watchpoint
+    pthread_mutex_lock(&dbg->wp_mutex);
+    int wp_id = -1;
+    char wp_class_sig[256] = "?";
+    char wp_field_name[128] = "?";
+    for (auto& wp : dbg->watchpoints) {
+        if (wp.on_read && wp.field_id == field &&
+                jni->IsSameObject(field_klass, wp.klass)) {
+            wp_id = wp.id;
+            strncpy(wp_class_sig, wp.class_sig, sizeof(wp_class_sig) - 1);
+            strncpy(wp_field_name, wp.field_name, sizeof(wp_field_name) - 1);
+            break;
+        }
+    }
+    pthread_mutex_unlock(&dbg->wp_mutex);
+
+    // Get thread name
+    jvmtiThreadInfo tinfo;
+    memset(&tinfo, 0, sizeof(tinfo));
+    jvmti->GetThreadInfo(thread, &tinfo);
+    const char* tname = tinfo.name ? tinfo.name : "?";
+
+    // Get method info
+    char* mclass_sig = nullptr;
+    char* mname = nullptr;
+    char* msig = nullptr;
+    jclass mdecl = nullptr;
+    if (jvmti->GetMethodDeclaringClass(method, &mdecl) == JVMTI_ERROR_NONE && mdecl) {
+        jvmti->GetClassSignature(mdecl, &mclass_sig, nullptr);
+    }
+    jvmti->GetMethodName(method, &mname, &msig, nullptr);
+
+    ALOGI("[DBG] Watchpoint #%d read: %s.%s at %s.%s+%lld thread:%s",
+          wp_id, wp_class_sig, wp_field_name,
+          mclass_sig ? mclass_sig : "?", mname ? mname : "?",
+          (long long)location, tname);
+
+    JsonBuf jb;
+    json_start(&jb);
+    json_add_string(&jb, "type", "watchpoint_hit");
+    json_add_int(&jb, "wp_id", wp_id);
+    json_add_string(&jb, "field", wp_field_name);
+    json_add_string(&jb, "class", wp_class_sig);
+    json_add_string(&jb, "access", "read");
+    json_add_string(&jb, "thread", tname);
+    json_add_string(&jb, "method", mname ? mname : "?");
+    json_add_string(&jb, "method_class", mclass_sig ? mclass_sig : "?");
+    json_add_long(&jb, "location", (long long)location);
+    json_end(&jb);
+    SendToClient(jb.buf);
+
+    if (tinfo.name) jvmti->Deallocate(reinterpret_cast<unsigned char*>(tinfo.name));
+    if (mclass_sig) jvmti->Deallocate(reinterpret_cast<unsigned char*>(mclass_sig));
+    if (mname) jvmti->Deallocate(reinterpret_cast<unsigned char*>(mname));
+    if (msig) jvmti->Deallocate(reinterpret_cast<unsigned char*>(msig));
+    if (mdecl) jni->DeleteLocalRef(mdecl);
+
+    DebuggerCommandLoop(jvmti, jni, thread, method, location, -1);
+}
+
 static void LogPotentialCapabilities(jvmtiEnv* jvmti) {
     jvmtiCapabilities potential;
     memset(&potential, 0, sizeof(potential));
@@ -1151,6 +1324,8 @@ static void LogPotentialCapabilities(jvmtiEnv* jvmti) {
     ALOGI("  can_generate_all_class_hook_events:       %d", potential.can_generate_all_class_hook_events);
     ALOGI("  can_redefine_classes:                     %d", potential.can_redefine_classes);
     ALOGI("  can_retransform_classes:                  %d", potential.can_retransform_classes);
+    ALOGI("  can_generate_field_access_events:         %d", potential.can_generate_field_access_events);
+    ALOGI("  can_generate_field_modification_events:   %d", potential.can_generate_field_modification_events);
     ALOGI("================================");
 }
 
@@ -1265,6 +1440,14 @@ static jint SetupJvmtiAgent(JavaVM* vm, const char* entry_point) {
     if (potential.can_retransform_classes) {
         caps.can_retransform_classes = 1;
     }
+    bool have_field_watch = false;
+    if (potential.can_generate_field_access_events &&
+            potential.can_generate_field_modification_events) {
+        caps.can_generate_field_access_events = 1;
+        caps.can_generate_field_modification_events = 1;
+        have_field_watch = true;
+    }
+
     // CLASS_PREPARE needs no capability — always available
     have_class_prepare = true;
 
@@ -1273,10 +1456,10 @@ static jint SetupJvmtiAgent(JavaVM* vm, const char* entry_point) {
         ALOGE("AddCapabilities failed: %d", err);
         return JNI_ERR;
     }
-    ALOGI("Capabilities added (jit=%d, entry=%d, exit=%d, exception=%d, bytecodes=%d, locals=%d, bp=%d, step=%d, tag=%d, redefine=%d, retransform=%d)",
+    ALOGI("Capabilities added (jit=%d, entry=%d, exit=%d, exception=%d, bytecodes=%d, locals=%d, bp=%d, step=%d, tag=%d, redefine=%d, retransform=%d, field_watch=%d)",
           have_jit, have_method_entry, have_method_exit, have_exception, g_have_bytecodes, g_have_local_vars,
           have_breakpoint, have_single_step, have_tag_objects,
-          (int)caps.can_redefine_classes, (int)caps.can_retransform_classes);
+          (int)caps.can_redefine_classes, (int)caps.can_retransform_classes, have_field_watch);
 
     // Create dump directory for bytecodes
     if (g_have_bytecodes) {
@@ -1315,6 +1498,10 @@ static jint SetupJvmtiAgent(JavaVM* vm, const char* entry_point) {
     callbacks.ThreadStart = OnThreadStart;
     if (have_frame_pop) {
         callbacks.FramePop = OnFramePop;
+    }
+    if (have_field_watch) {
+        callbacks.FieldModification = OnFieldModification;
+        callbacks.FieldAccess = OnFieldAccess;
     }
 
     err = jvmti->SetEventCallbacks(&callbacks, sizeof(callbacks));

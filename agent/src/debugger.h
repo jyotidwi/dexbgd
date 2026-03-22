@@ -29,6 +29,18 @@ struct Breakpoint {
     char method_sig_str[256];
 };
 
+struct Watchpoint {
+    int      id;
+    jclass   klass;          // global ref -- must DeleteGlobalRef on clear
+    jfieldID field_id;
+    char     class_sig[256];
+    char     field_name[128];
+    char     field_sig[64];
+    bool     on_read;
+    bool     on_write;
+    bool     is_static;
+};
+
 // A breakpoint that cannot be set yet because its class is not loaded.
 // Queued in g_pending_bps; set via CLASS_PREPARE event.
 struct PendingBreakpoint {
@@ -71,6 +83,12 @@ struct DebuggerState {
     // Breakpoints
     std::vector<Breakpoint> breakpoints;
     int next_bp_id;
+
+    // Watchpoints
+    std::vector<Watchpoint> watchpoints;
+    int next_wp_id;
+    pthread_mutex_t wp_mutex;
+    bool cap_field_watch;  // can_generate_field_access/modification_events
 
     // Stepping state (per-thread, single-thread for Phase 1)
     StepMode step_mode;

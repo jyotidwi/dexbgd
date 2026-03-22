@@ -1797,6 +1797,259 @@ static void CmdInspect(jvmtiEnv* jvmti, JNIEnv* jni, jthread thread,
     jni->DeleteLocalRef(obj);
 }
 
+// ---------------------------------------------------------------------------
+// Watchpoints: set_watchpoint, clear_watchpoint, list_watchpoints
+// ---------------------------------------------------------------------------
+
+// Helper: convert JNI class sig like "Lcom/foo/Bar;" to internal form "com/foo/Bar"
+static void SigToInternal(const char* sig, char* out, size_t out_len) {
+    const char* s = sig;
+    if (s[0] == 'L') s++;  // strip leading 'L'
+    size_t len = strlen(s);
+    if (len > 0 && s[len - 1] == ';') len--;  // strip trailing ';'
+    size_t copy = len < out_len - 1 ? len : out_len - 1;
+    strncpy(out, s, copy);
+    out[copy] = '\0';
+}
+
+static void CmdSetWatchpoint(jvmtiEnv* jvmti, JNIEnv* jni, jthread thread,
+                              const char* json) {
+    if (!g_dbg.cap_field_watch) {
+        SendError("set_watchpoint: field watch not available on this device");
+        return;
+    }
+
+    char class_sig[256] = "";
+    char field_name[128] = "";
+    int on_read = 1;
+    int on_write = 1;
+
+    if (!json_get_string(json, "class_sig", class_sig, sizeof(class_sig))) {
+        SendError("set_watchpoint: missing class_sig");
+        return;
+    }
+    if (!json_get_string(json, "field_name", field_name, sizeof(field_name))) {
+        SendError("set_watchpoint: missing field_name");
+        return;
+    }
+    json_get_int(json, "on_read", &on_read);
+    json_get_int(json, "on_write", &on_write);
+
+    // Use GetLoadedClasses-based lookup — jni->FindClass only searches the
+    // bootstrap classloader and cannot find app classes from a native thread.
+    jclass klass = FindClassBySig(jvmti, jni, class_sig);
+    if (!klass) {
+        SendError("set_watchpoint: class not found: %s", class_sig);
+        return;
+    }
+
+    // Walk class and superclasses to find field by name
+    jfieldID found_fid = nullptr;
+    jclass found_klass = nullptr;
+    char found_fsig[64] = "";
+    bool found_static = false;
+
+    // FindClassBySig returns a global ref — use it directly as cur, no re-wrap needed.
+    jclass cur = klass;
+
+    while (cur && !found_fid) {
+        jint count = 0;
+        jfieldID* fids = nullptr;
+        jvmti->GetClassFields(cur, &count, &fids);
+
+        for (int i = 0; i < count; i++) {
+            char* fname = nullptr;
+            char* fsig = nullptr;
+            jint fmod = 0;
+            jvmti->GetFieldName(cur, fids[i], &fname, &fsig, nullptr);
+            jvmti->GetFieldModifiers(cur, fids[i], &fmod);
+
+            if (fname && strcmp(fname, field_name) == 0) {
+                found_fid = fids[i];
+                found_klass = (jclass)jni->NewGlobalRef(cur);
+                if (fsig) {
+                    strncpy(found_fsig, fsig, sizeof(found_fsig) - 1);
+                    found_fsig[sizeof(found_fsig) - 1] = '\0';
+                }
+                found_static = (fmod & 0x0008) != 0;
+                if (fname) jvmti->Deallocate(reinterpret_cast<unsigned char*>(fname));
+                if (fsig) jvmti->Deallocate(reinterpret_cast<unsigned char*>(fsig));
+                break;
+            }
+
+            if (fname) jvmti->Deallocate(reinterpret_cast<unsigned char*>(fname));
+            if (fsig) jvmti->Deallocate(reinterpret_cast<unsigned char*>(fsig));
+        }
+
+        if (fids) jvmti->Deallocate(reinterpret_cast<unsigned char*>(fids));
+
+        if (!found_fid) {
+            jclass super = jni->GetSuperclass(cur);
+            jni->DeleteGlobalRef(cur);
+            cur = super ? (jclass)jni->NewGlobalRef(super) : nullptr;
+            if (super) jni->DeleteLocalRef(super);
+        } else {
+            jni->DeleteGlobalRef(cur);
+            cur = nullptr;
+        }
+    }
+    if (cur) jni->DeleteGlobalRef(cur);
+
+    if (!found_fid || !found_klass) {
+        SendError("set_watchpoint: field not found: %s.%s", class_sig, field_name);
+        return;
+    }
+
+    // Set watches
+    bool any_set = false;
+    if (on_write) {
+        jvmtiError err = jvmti->SetFieldModificationWatch(found_klass, found_fid);
+        if (err != JVMTI_ERROR_NONE && err != JVMTI_ERROR_DUPLICATE) {
+            jni->DeleteGlobalRef(found_klass);
+            SendError("set_watchpoint: SetFieldModificationWatch failed (err=%d)", (int)err);
+            return;
+        }
+        any_set = true;
+    }
+    if (on_read) {
+        jvmtiError err = jvmti->SetFieldAccessWatch(found_klass, found_fid);
+        if (err != JVMTI_ERROR_NONE && err != JVMTI_ERROR_DUPLICATE) {
+            if (on_write) jvmti->ClearFieldModificationWatch(found_klass, found_fid);
+            jni->DeleteGlobalRef(found_klass);
+            SendError("set_watchpoint: SetFieldAccessWatch failed (err=%d)", (int)err);
+            return;
+        }
+        any_set = true;
+    }
+
+    // Get class sig of the declaring class (may differ from requested class in superclass case)
+    char declared_sig[256] = "";
+    char* dsig = nullptr;
+    if (jvmti->GetClassSignature(found_klass, &dsig, nullptr) == JVMTI_ERROR_NONE && dsig) {
+        strncpy(declared_sig, dsig, sizeof(declared_sig) - 1);
+        declared_sig[sizeof(declared_sig) - 1] = '\0';
+        jvmti->Deallocate(reinterpret_cast<unsigned char*>(dsig));
+    } else {
+        strncpy(declared_sig, class_sig, sizeof(declared_sig) - 1);
+        declared_sig[sizeof(declared_sig) - 1] = '\0';
+    }
+
+    // Store watchpoint
+    pthread_mutex_lock(&g_dbg.wp_mutex);
+    bool is_first = g_dbg.watchpoints.empty();
+
+    Watchpoint wp;
+    wp.id = g_dbg.next_wp_id++;
+    wp.klass = found_klass;
+    wp.field_id = found_fid;
+    strncpy(wp.class_sig, declared_sig, sizeof(wp.class_sig) - 1);
+    wp.class_sig[sizeof(wp.class_sig) - 1] = '\0';
+    strncpy(wp.field_name, field_name, sizeof(wp.field_name) - 1);
+    wp.field_name[sizeof(wp.field_name) - 1] = '\0';
+    strncpy(wp.field_sig, found_fsig, sizeof(wp.field_sig) - 1);
+    wp.field_sig[sizeof(wp.field_sig) - 1] = '\0';
+    wp.on_read = (on_read != 0);
+    wp.on_write = (on_write != 0);
+    wp.is_static = found_static;
+    int new_id = wp.id;
+    g_dbg.watchpoints.push_back(wp);
+    pthread_mutex_unlock(&g_dbg.wp_mutex);
+
+    // Enable events on first watchpoint
+    if (is_first) {
+        jvmti->SetEventNotificationMode(JVMTI_ENABLE, JVMTI_EVENT_FIELD_MODIFICATION, nullptr);
+        jvmti->SetEventNotificationMode(JVMTI_ENABLE, JVMTI_EVENT_FIELD_ACCESS, nullptr);
+    }
+
+    ALOGI("[DBG] Watchpoint #%d set: %s.%s (%s) read=%d write=%d",
+          new_id, declared_sig, field_name, found_fsig, on_read, on_write);
+
+    JsonBuf jb;
+    json_start(&jb);
+    json_add_string(&jb, "type", "wp_set_ok");
+    json_add_int(&jb, "id", new_id);
+    json_add_string(&jb, "field", field_name);
+    json_add_string(&jb, "class", declared_sig);
+    json_end(&jb);
+    SendToClient(jb.buf);
+    (void)any_set;
+}
+
+static void CmdClearWatchpoint(jvmtiEnv* jvmti, JNIEnv* jni, const char* json) {
+    int wp_id = -1;
+    if (!json_get_int(json, "id", &wp_id)) {
+        SendError("clear_watchpoint: missing id");
+        return;
+    }
+
+    pthread_mutex_lock(&g_dbg.wp_mutex);
+    bool found = false;
+    for (auto it = g_dbg.watchpoints.begin(); it != g_dbg.watchpoints.end(); ++it) {
+        if (it->id == wp_id) {
+            jvmti->ClearFieldModificationWatch(it->klass, it->field_id);
+            jvmti->ClearFieldAccessWatch(it->klass, it->field_id);
+            jni->DeleteGlobalRef(it->klass);
+            ALOGI("[DBG] Watchpoint #%d cleared: %s.%s", wp_id, it->class_sig, it->field_name);
+            g_dbg.watchpoints.erase(it);
+            found = true;
+            break;
+        }
+    }
+    bool empty = g_dbg.watchpoints.empty();
+    pthread_mutex_unlock(&g_dbg.wp_mutex);
+
+    if (!found) {
+        SendError("clear_watchpoint: watchpoint not found (id=%d)", wp_id);
+        return;
+    }
+
+    // Disable events when no more watchpoints
+    if (empty) {
+        jvmti->SetEventNotificationMode(JVMTI_DISABLE, JVMTI_EVENT_FIELD_MODIFICATION, nullptr);
+        jvmti->SetEventNotificationMode(JVMTI_DISABLE, JVMTI_EVENT_FIELD_ACCESS, nullptr);
+    }
+
+    JsonBuf jb;
+    json_start(&jb);
+    json_add_string(&jb, "type", "wp_clear_ok");
+    json_add_int(&jb, "id", wp_id);
+    json_end(&jb);
+    SendToClient(jb.buf);
+}
+
+static void CmdListWatchpoints(jvmtiEnv* jvmti, JNIEnv* jni, const char* json) {
+    (void)jvmti; (void)jni; (void)json;
+
+    JsonArrayBuf ab;
+    json_array_start(&ab);
+
+    pthread_mutex_lock(&g_dbg.wp_mutex);
+    for (auto& wp : g_dbg.watchpoints) {
+        JsonBuf obj;
+        json_start(&obj);
+        json_add_int(&obj, "id", wp.id);
+        json_add_string(&obj, "class", wp.class_sig);
+        json_add_string(&obj, "field", wp.field_name);
+        json_add_string(&obj, "sig", wp.field_sig);
+        json_add_int(&obj, "on_read", wp.on_read ? 1 : 0);
+        json_add_int(&obj, "on_write", wp.on_write ? 1 : 0);
+        json_add_int(&obj, "is_static", wp.is_static ? 1 : 0);
+        json_end(&obj);
+        obj.buf[obj.pos - 1] = '\0'; obj.pos -= 1;
+        json_array_add_object(&ab, obj.buf);
+    }
+    pthread_mutex_unlock(&g_dbg.wp_mutex);
+
+    json_array_end(&ab);
+
+    JsonBuf jb;
+    json_start(&jb);
+    json_add_string(&jb, "type", "wp_list");
+    json_add_raw(&jb, "watchpoints", ab.buf);
+    json_end(&jb);
+    SendToClient(jb.buf);
+}
+
 // eval: call a no-arg method or read a field on an object at a local variable slot
 // Syntax: vN.member() for method call, vN.member for field access
 static void CmdEval(jvmtiEnv* jvmti, JNIEnv* jni, jthread thread,
@@ -4662,6 +4915,12 @@ static void DispatchGlobalCommand(jvmtiEnv* jvmti, JNIEnv* jni,
         CmdJniRedirectSet(jvmti, jni, json);
     } else if (strcmp(cmd, "jni_redirect_clear") == 0) {
         CmdJniRedirectClear(jvmti, jni, json);
+    } else if (strcmp(cmd, "set_watchpoint") == 0) {
+        CmdSetWatchpoint(jvmti, jni, nullptr, json);
+    } else if (strcmp(cmd, "clear_watchpoint") == 0) {
+        CmdClearWatchpoint(jvmti, jni, json);
+    } else if (strcmp(cmd, "list_watchpoints") == 0) {
+        CmdListWatchpoints(jvmti, jni, json);
     } else {
         SendError("unknown cmd: %s", cmd);
     }
@@ -5041,6 +5300,8 @@ void StartDebugger(jvmtiEnv* jvmti, JavaVM* vm) {
     g_dbg.server_fd = -1;
     g_dbg.client_fd = -1;
     g_dbg.next_bp_id = 1;
+    g_dbg.next_wp_id = 1;
+    g_dbg.cap_field_watch = false;
     g_dbg.step_mode = STEP_NONE;
     g_dbg.step_thread = nullptr;
     g_dbg.thread_suspended = false;
@@ -5071,15 +5332,18 @@ void StartDebugger(jvmtiEnv* jvmti, JavaVM* vm) {
         g_dbg.cap_force_early_return = (caps.can_force_early_return != 0);
         g_dbg.cap_pop_frame = (caps.can_pop_frame != 0);
         g_dbg.cap_frame_pop = (caps.can_generate_frame_pop_events != 0);
-        ALOGI("[DBG] Caps: bytecodes=%d locals=%d bp=%d step=%d tags=%d lines=%d exit=%d force_ret=%d pop_frame=%d frame_pop=%d",
+        g_dbg.cap_field_watch = (caps.can_generate_field_access_events != 0 &&
+                                  caps.can_generate_field_modification_events != 0);
+        ALOGI("[DBG] Caps: bytecodes=%d locals=%d bp=%d step=%d tags=%d lines=%d exit=%d force_ret=%d pop_frame=%d frame_pop=%d field_watch=%d",
               g_dbg.cap_bytecodes, g_dbg.cap_local_vars, g_dbg.cap_breakpoints,
               g_dbg.cap_single_step, g_dbg.cap_tag_objects, g_dbg.cap_line_numbers,
               g_dbg.cap_method_exit, g_dbg.cap_force_early_return, g_dbg.cap_pop_frame,
-              g_dbg.cap_frame_pop);
+              g_dbg.cap_frame_pop, g_dbg.cap_field_watch);
     }
 
     pthread_mutex_init(&g_dbg.sock_mutex, nullptr);
     pthread_mutex_init(&g_dbg.queue_mutex, nullptr);
+    pthread_mutex_init(&g_dbg.wp_mutex, nullptr);
     pthread_cond_init(&g_dbg.queue_cond, nullptr);
 
     pthread_t tid;

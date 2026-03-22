@@ -187,6 +187,16 @@ pub struct WatchEntry {
     pub last_type:  Option<String>,
 }
 
+/// A field watchpoint tracked on the server side.
+#[derive(Debug, Clone)]
+pub struct WatchpointInfo {
+    pub id:         i32,
+    pub class_sig:  String,
+    pub field_name: String,
+    pub on_read:    bool,
+    pub on_write:   bool,
+}
+
 /// A user-placed bookmark in the disassembly.
 #[derive(Debug, Clone)]
 pub struct Bookmark {
@@ -394,6 +404,9 @@ pub struct App {
 
     // Breakpoints
     pub bp_manager: BreakpointManager,
+
+    // Watchpoints (field access/modification breakpoints)
+    pub watchpoints: Vec<WatchpointInfo>,
 
     // Watch expressions
     pub watches: Vec<WatchEntry>,
@@ -645,6 +658,7 @@ impl App {
             stack: Vec::new(),
             threads: Vec::new(),
             bp_manager: BreakpointManager::default(),
+            watchpoints: Vec::new(),
             watches: Vec::new(),
             watch_selected: 0,
             bookmarks: Vec::new(),
@@ -1695,6 +1709,42 @@ impl App {
 
             AgentMessage::CallOverflow { dropped, window_ms } => {
                 self.log_error(&format!("Call overflow: {} dropped in {}ms window (rate limit)", dropped, window_ms));
+            }
+
+            AgentMessage::WpSetOk { id, field, class } => {
+                // Update the placeholder entry we added in do_set_watchpoint
+                if let Some(wp) = self.watchpoints.iter_mut().find(|w| w.id == -1) {
+                    wp.id = id;
+                }
+                self.log_info(&format!("[ba#{}] watching {}.{}", id, class, field));
+            }
+
+            AgentMessage::WpClearOk { id } => {
+                self.watchpoints.retain(|w| w.id != id);
+                self.log_info(&format!("[ba#{}] cleared", id));
+            }
+
+            AgentMessage::WpList { watchpoints } => {
+                self.log_info(&format!("Watchpoints: {}", watchpoints));
+            }
+
+            AgentMessage::WatchpointHit { wp_id: _, field, class, access, new_value, thread, method, method_class, location } => {
+                let val_str = new_value.as_deref().unwrap_or("");
+                if access == "write" {
+                    self.log_info(&format!("[watchpoint] {}.{} = {} (written at {}.{}+{}  thread:{})",
+                        class, field, val_str, method_class, method, location, thread));
+                } else {
+                    self.log_info(&format!("[watchpoint] {}.{} read at {}.{}+{}  thread:{}",
+                        class, field, method_class, method, location, thread));
+                }
+                self.stepping_quiet = false;
+                self.state = AppState::Suspended;
+                self.current_class = Some(method_class.clone());
+                self.current_method = Some(method.clone());
+                self.current_loc = Some(location);
+                self.current_line = None;
+                self.send_command(OutboundCommand::Stack {});
+                self.auto_refresh();
             }
 
             AgentMessage::Error { msg } => {
@@ -4552,6 +4602,25 @@ impl App {
             return;
         }
 
+        // wp CLASS FIELD [read|write]  -- set watchpoint on field
+        // ba [r|w] Class; field  -- break on access (watchpoint)
+        if input.starts_with("ba ") || input == "ba" {
+            let rest = input.splitn(2, ' ').nth(1).unwrap_or("").trim();
+            self.do_set_watchpoint(rest);
+            return;
+        }
+        // bad N  -- delete break-on-access watchpoint
+        if input.starts_with("bad ") {
+            let rest = input.splitn(2, ' ').nth(1).unwrap_or("").trim();
+            self.do_clear_watchpoint(rest);
+            return;
+        }
+        // bal  -- list break-on-access watchpoints
+        if input == "bal" {
+            self.do_list_watchpoints();
+            return;
+        }
+
         // Alias commands (pure server-side, no connection needed)
         if input == "alias" {
             self.log_info("usage: alias <class> <label>  |  alias list  |  alias clear <class|*>");
@@ -5736,6 +5805,76 @@ impl App {
         self.send_command(OutboundCommand::SetLocal { slot, value, type_hint: Some(type_hint) });
         self.send_command(OutboundCommand::Locals {});
         self.send_command(OutboundCommand::Regs {});
+    }
+
+    fn do_set_watchpoint(&mut self, rest: &str) {
+        // Syntax: [static] Lcom/pkg/Class; fieldName [read|write]
+        let mut parts: Vec<&str> = rest.split_whitespace().collect();
+
+        // Strip optional "static" keyword — agent detects static via field modifiers
+        if parts.first() == Some(&"static") {
+            parts.remove(0);
+        }
+
+        // Determine mode: optional first token r/w, or default both
+        let mut on_read = true;
+        let mut on_write = true;
+        if parts.first() == Some(&"r") { on_read = true;  on_write = false; parts.remove(0); }
+        else if parts.first() == Some(&"w") { on_read = false; on_write = true;  parts.remove(0); }
+
+        if parts.len() < 2 {
+            self.log_error("Usage: ba [r|w] Lcom/pkg/Class; fieldName");
+            return;
+        }
+
+        let class_raw  = parts[0];
+        let field_name = parts[1].to_string();
+
+        // Normalize class sig to JNI form
+        let class_sig = if class_raw.starts_with('L') && class_raw.ends_with(';') {
+            class_raw.to_string()
+        } else {
+            format!("L{};", class_raw.replace('.', "/"))
+        };
+
+        let mode = if on_read && on_write { "r+w" } else if on_write { "w" } else { "r" };
+        self.log_info(&format!("ba: watching {}.{} [{}]", class_sig, field_name, mode));
+
+        // Store pending watchpoint info so we can populate it when WpSetOk arrives
+        self.watchpoints.push(WatchpointInfo {
+            id: -1,  // placeholder until confirmed
+            class_sig: class_sig.clone(),
+            field_name: field_name.clone(),
+            on_read,
+            on_write,
+        });
+
+        self.send_command(OutboundCommand::SetWatchpoint { class_sig, field_name, on_read, on_write });
+    }
+
+    fn do_clear_watchpoint(&mut self, rest: &str) {
+        match rest.trim().parse::<i32>() {
+            Ok(id) => {
+                self.send_command(OutboundCommand::ClearWatchpoint { id });
+            }
+            Err(_) => self.log_error("Usage: bad N (watchpoint id)"),
+        }
+    }
+
+    fn do_list_watchpoints(&mut self) {
+        if self.watchpoints.is_empty() {
+            self.log_info("No break-on-access watchpoints set");
+            return;
+        }
+        for wp in self.watchpoints.clone() {
+            let mode = match (wp.on_read, wp.on_write) {
+                (true, true)   => "r+w",
+                (true, false)  => "r",
+                (false, true)  => "w",
+                _              => "?",
+            };
+            self.log_info(&format!("  ba#{} {}.{} [{}]", wp.id, wp.class_sig, wp.field_name, mode));
+        }
     }
 
     fn do_kill(&mut self) {

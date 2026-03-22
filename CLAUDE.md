@@ -67,4 +67,5 @@ slot = GetMaxLocals(method) - GetArgumentsSize(method) + param_idx;
 - breakpoints, single_step, local_vars, line_numbers, bytecodes: yes
 - method_entry, method_exit, exceptions, tag_objects: yes
 - force_early_return, pop_frame: yes
+- field_access_events, field_modification_events: yes
 - compiled_method_load, all_class_hook: no (user build)
