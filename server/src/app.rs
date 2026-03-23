@@ -22,6 +22,28 @@ use crate::tui::statusbar::{self, StatusBarAction};
 // Clipboard helper  - platform-specific
 // ---------------------------------------------------------------------------
 
+/// Returns the decompiled-list index for a raw bytecodes index.
+/// If the raw instruction is noise (filtered), returns the last non-noise index before it.
+fn decompiled_idx_of(bytecodes: &[Instruction], raw_idx: usize) -> usize {
+    use crate::tui::bytecodes::is_decompiler_noise;
+    let clamped = raw_idx.min(bytecodes.len().saturating_sub(1));
+    bytecodes[..=clamped].iter()
+        .filter(|i| !is_decompiler_noise(&i.text))
+        .count()
+        .saturating_sub(1)
+}
+
+/// Returns the raw bytecodes index of the nth non-noise instruction.
+fn raw_idx_for_decompiled(bytecodes: &[Instruction], n: usize) -> usize {
+    use crate::tui::bytecodes::is_decompiler_noise;
+    bytecodes.iter()
+        .enumerate()
+        .filter(|(_, i)| !is_decompiler_noise(&i.text))
+        .nth(n)
+        .map(|(idx, _)| idx)
+        .unwrap_or(0)
+}
+
 fn copy_to_clipboard(text: &str) {
     #[cfg(target_os = "windows")]
     {
@@ -1313,13 +1335,24 @@ impl App {
                         .map(|g| g.bytecodes_area.height.saturating_sub(2).saturating_sub(1) as usize)
                         .unwrap_or(20);
                     if let Some(new_idx) = self.bytecodes.iter().position(|i| i.offset == location as u32) {
-                        let visible = new_idx >= self.bytecodes_scroll
-                            && new_idx < self.bytecodes_scroll + code_height.max(1);
-                        if !visible {
-                            // Scroll to show 2 instructions before PC
-                            self.bytecodes_scroll = new_idx.saturating_sub(2);
+                        if self.left_tab == LeftTab::Decompiler {
+                            // Check visibility in decompiled (filtered) space so that the ►
+                            // walks all the way to the last visible line before the view jumps,
+                            // and lands with 2 context lines above — same feel as Bytecodes tab.
+                            let pc_dec = decompiled_idx_of(&self.bytecodes, new_idx);
+                            let base_dec = decompiled_idx_of(&self.bytecodes,
+                                self.bytecodes_scroll.min(self.bytecodes.len().saturating_sub(1)));
+                            let visible = pc_dec >= base_dec && pc_dec < base_dec + code_height.max(1);
+                            if !visible {
+                                self.bytecodes_scroll = raw_idx_for_decompiled(&self.bytecodes, pc_dec.saturating_sub(2));
+                            }
+                        } else {
+                            let visible = new_idx >= self.bytecodes_scroll
+                                && new_idx < self.bytecodes_scroll + code_height.max(1);
+                            if !visible {
+                                self.bytecodes_scroll = new_idx.saturating_sub(2);
+                            }
                         }
-                        // bytecodes_auto_scroll stays false; view follows PC only when needed
                     } else {
                         // PC offset not in current bytecodes (shouldn't normally happen) — full refresh
                         self.auto_refresh();

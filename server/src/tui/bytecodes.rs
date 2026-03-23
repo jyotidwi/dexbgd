@@ -11,6 +11,18 @@ use crate::disassembler;
 use crate::theme::Theme;
 use super::make_block;
 
+/// Returns true if this Dalvik instruction is "noise" that the Decompiler tab filters out.
+pub fn is_decompiler_noise(text: &str) -> bool {
+    let first_word = text.split_whitespace().next().unwrap_or("");
+    matches!(first_word,
+        "nop" | "move" | "move/from16" | "move/16"
+        | "move-wide" | "move-wide/from16" | "move-wide/16"
+        | "move-object" | "move-object/from16" | "move-object/16"
+        | "move-result" | "move-result-wide" | "move-result-object"
+        | "move-exception"
+    )
+}
+
 /// Apply class aliases to an instruction text string.
 /// Replaces "ShortName." with "Alias." for every known alias.
 /// Only substitutes when followed by '.' to avoid false positives.
@@ -560,14 +572,7 @@ fn draw_decompiler(f: &mut Frame, app: &App, area: Rect, block: ratatui::widgets
         let first_word = text.split_whitespace().next().unwrap_or("");
 
         // Skip noise instructions
-        match first_word {
-            "nop" | "move" | "move/from16" | "move/16"
-            | "move-wide" | "move-wide/from16" | "move-wide/16"
-            | "move-object" | "move-object/from16" | "move-object/16"
-            | "move-result" | "move-result-wide" | "move-result-object"
-            | "move-exception" => continue,
-            _ => {}
-        }
+        if is_decompiler_noise(text) { continue; }
 
         // Determine importance and format
         let (spans, important) = decompile_instruction(text, first_word, t);
@@ -587,14 +592,38 @@ fn draw_decompiler(f: &mut Frame, app: &App, area: Rect, block: ratatui::widgets
         decompiled.iter().rposition(|(off, _, _)| *off <= cur_offset)
     });
 
-    let scroll = if app.bytecodes_auto_scroll {
-        if let Some(idx) = scroll_dec_idx {
-            if code_height > 0 { idx.saturating_sub(code_height / 2) } else { 0 }
+    // Translate bytecodes_scroll (raw index) to decompiled index via offset matching.
+    // bytecodes_scroll may be larger than decompiled.len() because noise instructions
+    // are filtered out.
+    let base_scroll = {
+        let raw_offset = app.bytecodes.get(app.bytecodes_scroll)
+            .map(|i| i.offset)
+            .unwrap_or(u32::MAX);
+        decompiled.iter()
+            .position(|(off, _, _)| *off >= raw_offset)
+            .unwrap_or_else(|| decompiled.len().saturating_sub(1))
+    };
+
+    // Clamp so the ► (PC) line is always visible.
+    // On initial load (auto_scroll) center the PC; otherwise only scroll when the PC
+    // walks off the edge — letting the marker travel all the way to the bottom before
+    // the view advances (same feel as a classic step-through debugger).
+    let scroll = if let Some(pc_idx) = scroll_dec_idx {
+        if app.bytecodes_auto_scroll {
+            // First arrival: center the PC in the view.
+            if code_height > 0 { pc_idx.saturating_sub(code_height / 2) } else { 0 }
+        } else if pc_idx < base_scroll {
+            // PC scrolled above the top edge — follow it up.
+            pc_idx
+        } else if code_height > 0 && pc_idx >= base_scroll + code_height {
+            // PC walked off the bottom edge — scroll just enough to show it.
+            pc_idx.saturating_sub(code_height - 1)
         } else {
-            app.bytecodes_scroll
+            // PC still visible — keep the view where it is.
+            base_scroll
         }
     } else {
-        app.bytecodes_scroll
+        base_scroll
     };
 
     let mut lines: Vec<Line> = Vec::with_capacity(inner_height);
