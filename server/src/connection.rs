@@ -36,7 +36,13 @@ pub fn spawn_io_thread(
                                             }
                                         }
                                         Err(e) => {
-                                            eprintln!("[IO] parse error: {} in: {}", e, line);
+                                            // Route through channel so it appears in the TUI
+                                            // log instead of corrupting the terminal via eprintln.
+                                            // Truncate the raw line to avoid flooding the log.
+                                            let preview: String = line.chars().take(80).collect();
+                                            let _ = agent_tx_clone.send(AgentMessage::Error {
+                                                msg: format!("[IO] parse error: {} (line: {}...)", e, preview),
+                                            });
                                         }
                                     }
                                 }

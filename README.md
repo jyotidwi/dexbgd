@@ -529,8 +529,11 @@ adb shell su -c "cp /data/local/tmp/libart_jit_tracer.so /data/app/*/com.target.
 Then attach:
 
 ```
-agent\scripts\attach.bat com.target.app --ptrace
+agent\scripts\attach_any.bat com.target.app --ptrace
+agent/scripts/attach_any.sh  com.target.app --ptrace
 ```
+
+`attach_any` auto-discovers the launcher activity and handles split APKs — use it instead of `attach.bat` for production apps that don't use `.MainActivity`. It also supports `--quick` and `--sigstop` modes.
 
 This injects the agent into the running process via ptrace — no APK modification needed.
 

@@ -1566,13 +1566,16 @@ static void CmdStack(jvmtiEnv* jvmti, JNIEnv* jni, jthread thread) {
     }
     json_array_end(&ab);
 
-    JsonBuf jb;
-    json_start(&jb);
-    json_add_string(&jb, "type", "stack_result");
-    json_add_int(&jb, "count", frame_count);
-    json_add_raw(&jb, "frames", ab.buf);
-    json_end(&jb);
-    SendToClient(jb.buf);
+    // ab.buf can be up to 16KB; the outer JsonBuf (also 16KB) cannot hold it plus the
+    // wrapper fields, so use a heap buffer sized to fit both.
+    int out_size = ab.pos + 64;  // ab.buf + wrapper overhead
+    char* out = (char*)malloc(out_size);
+    if (!out) { SendError("stack: out of memory"); return; }
+    snprintf(out, out_size,
+             "{\"type\":\"stack_result\",\"count\":%d,\"frames\":%s}\n",
+             frame_count, ab.buf);
+    SendToClient(out);
+    free(out);
 }
 
 // inspect: inspect an object at a given local variable slot

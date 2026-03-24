@@ -5121,7 +5121,7 @@ impl App {
             return;
         }
 
-        if input.starts_with("strings ") || input.starts_with("str ") {
+        if input == "strings" || input.starts_with("strings ") || input == "str" || input.starts_with("str ") {
             let pattern = input.splitn(2, ' ').nth(1).unwrap_or("").trim();
             self.do_dex_string_search(pattern);
             return;
