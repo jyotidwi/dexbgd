@@ -30,6 +30,7 @@
  * approach (BRK at saved_pc for the full dlopen duration) with a warning.
  */
 
+#include <dirent.h>
 #include <elf.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -37,6 +38,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <signal.h>
 #include <sys/ptrace.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
@@ -46,10 +48,19 @@
 #  define NT_PRSTATUS 1
 #endif
 #ifndef PTRACE_SEIZE
-#  define PTRACE_SEIZE     0x4206
+#  define PTRACE_SEIZE        0x4206
 #endif
 #ifndef PTRACE_INTERRUPT
-#  define PTRACE_INTERRUPT 0x4207
+#  define PTRACE_INTERRUPT    0x4207
+#endif
+#ifndef PTRACE_O_TRACECLONE
+#  define PTRACE_O_TRACECLONE 0x00000008
+#endif
+#ifndef PTRACE_EVENT_CLONE
+#  define PTRACE_EVENT_CLONE  3
+#endif
+#ifndef __WALL
+#  define __WALL              0x40000000
 #endif
 
 typedef struct {
@@ -314,6 +325,7 @@ int main(int argc, char *argv[])
 
     if (so_len > 512) { fprintf(stderr, "[inject] path too long\n"); return 1; }
     printf("[inject] pid=%d  so=%s\n", (int)pid, so);
+    fflush(stdout);
 
     int       wstatus = 0, result = 0;
     int       brk_patched = 0, trampoline_patched = 0;
@@ -321,6 +333,8 @@ int main(int argc, char *argv[])
     uint64_t  trampoline = 0, handle = 0;
     long      orig_code_word = 0, saved_trampoline_word = 0;
     Arm64Regs regs, saved;
+    /* Threads cloned during dlopen that we keep frozen until detach */
+    pid_t     frozen[64]; int nfrozen = 0;
     struct iovec iov;
     enum { SCRATCH_SZ = 512 };
     uint8_t   backup[SCRATCH_SZ];
@@ -338,6 +352,10 @@ int main(int argc, char *argv[])
         perror("[inject] PTRACE_INTERRUPT");
         ptrace(PTRACE_DETACH, pid, 0, 0); return 1;
     }
+    /* PTRACE_INTERRUPT on a running tracee delivers SIGTRAP|PTRACE_EVENT_STOP.
+     * PTRACE_INTERRUPT on a group-stopped tracee (SIGSTOP'd from outside)
+     * correctly reports SIGSTOP (sig=19) -- that IS the valid ptrace-stop;
+     * do not drain it. */
     if (waitpid(pid, &wstatus, 0) < 0 || !WIFSTOPPED(wstatus)) {
         fprintf(stderr, "[inject] not stopped (0x%x)\n", wstatus);
         ptrace(PTRACE_DETACH, pid, 0, 0); return 1;
@@ -394,8 +412,16 @@ int main(int argc, char *argv[])
     if (ptrace(PTRACE_CONT, pid, 0, 0) != 0) {
         perror("[inject] CONT mmap"); result = 1; goto restore;
     }
-    if (waitpid(pid, &wstatus, 0) < 0) {
-        perror("[inject] waitpid mmap"); result = 1; goto restore;
+    /* Drain SIGSTOP deliveries before the mmap SIGTRAP arrives (max 8). */
+    for (int _i = 0; _i < 8; _i++) {
+        if (waitpid(pid, &wstatus, 0) < 0) {
+            perror("[inject] waitpid mmap"); result = 1; goto restore;
+        }
+        if (WIFSTOPPED(wstatus) && WSTOPSIG(wstatus) == SIGSTOP) {
+            ptrace(PTRACE_CONT, pid, 0, 0);
+            continue;
+        }
+        break;
     }
     if (!WIFSTOPPED(wstatus) || WSTOPSIG(wstatus) != SIGTRAP) {
         fprintf(stderr, "[inject] mmap phase: unexpected stop (sig=%d, 0x%x) -- "
@@ -452,24 +478,35 @@ do_dlopen:
     if (ptrace(PTRACE_CONT, pid, 0, 0) != 0) {
         perror("[inject] CONT dlopen"); result = 1; goto restore;
     }
-    if (waitpid(pid, &wstatus, 0) < 0) {
-        perror("[inject] waitpid dlopen"); result = 1; goto restore;
-    }
-    if (!WIFSTOPPED(wstatus)) {
-        fprintf(stderr, "[inject] process terminated (0x%x)!\n", wstatus);
-        return 1;
-    }
-    if (WSTOPSIG(wstatus) != SIGTRAP) {
-        fprintf(stderr, "[inject] unexpected signal %d (expected SIGTRAP)\n",
-                WSTOPSIG(wstatus));
-        /* Print crash PC so we can identify the crash site in the library */
-        {
-            Arm64Regs crsh; struct iovec ciov = { &crsh, sizeof(crsh) };
-            if (ptrace(PTRACE_GETREGSET, pid, (void *)(long)NT_PRSTATUS, &ciov) == 0)
-                fprintf(stderr, "[inject] crash PC=0x%lx x0=0x%lx x1=0x%lx LR=0x%lx\n",
-                        crsh.pc, crsh.x[0], crsh.x[1], crsh.x[30]);
+    /* dlopen wait: suppress all signals on main thread.
+     * Anti-tamper heartbeat (sig 35) is suppressed so it cannot call kill().
+     * New threads run freely -- freezing them (PTRACE_O_TRACECLONE) deadlocks
+     * dlopen because ART/JIT threads it spawns never complete. */
+    for (int _i = 0; _i < 64; _i++) {
+        if (waitpid(pid, &wstatus, 0) < 0) {
+            perror("[inject] waitpid dlopen"); result = 1; goto restore;
         }
-        result = 1; goto restore;
+        if (!WIFSTOPPED(wstatus)) {
+            fprintf(stderr, "[inject] process terminated (0x%x)!\n", wstatus);
+            return 1;
+        }
+        int dsig = WSTOPSIG(wstatus);
+        if (dsig == SIGTRAP) {
+            /* Verify PC is at our trampoline (or saved_pc in fallback).
+             * ART JIT emits spurious BRK instructions -- ignore those. */
+            uint64_t brk_addr = trampoline ? trampoline : saved.pc;
+            Arm64Regs cur; struct iovec ciov = { &cur, sizeof(cur) };
+            ptrace(PTRACE_GETREGSET, pid, (void *)(long)NT_PRSTATUS, &ciov);
+            if (cur.pc == brk_addr) break;  /* our BRK -- dlopen returned */
+            printf("[inject] dlopen: spurious SIGTRAP at 0x%lx (expected 0x%lx), continuing\n",
+                   cur.pc, brk_addr);
+            fflush(stdout);
+            ptrace(PTRACE_CONT, pid, 0, 0);
+            continue;
+        }
+        printf("[inject] dlopen: suppressing signal %d\n", dsig);
+        fflush(stdout);
+        ptrace(PTRACE_CONT, pid, 0, 0);
     }
 
     /* 8. Read dlopen return value (x0) */
@@ -480,6 +517,12 @@ do_dlopen:
     }
     if (handle) {
         printf("[inject] dlopen OK  handle=0x%lx\n", handle);
+        /* The process was group-stopped (SIGSTOP) before injection.
+         * The main thread is paused under ptrace, but all other threads
+         * (including the agent's socket thread) are still group-stopped.
+         * Send SIGCONT to unfreeze them so the socket thread can start. */
+        kill(pid, SIGCONT);
+        printf("[inject] sent SIGCONT -- agent socket thread unfrozen\n");
         /* Poll for agent socket — the socket thread runs freely (only main is stopped) */
         printf("[inject] Waiting for agent socket @dexbgd...\n");
         fflush(stdout);
@@ -516,6 +559,12 @@ do_dlopen:
     }
 
 restore:
+    /* Detach any threads frozen via PTRACE_O_TRACECLONE.
+     * They start running after detach; by then TracerPid = 0 so
+     * anti-tamper checks see a clean process. */
+    for (int i = 0; i < nfrozen; i++)
+        ptrace(PTRACE_DETACH, frozen[i], 0, 0);
+
     /* Restore trampoline page word (if patched) */
     if (trampoline_patched)
         restore_insn(pid, trampoline, saved_trampoline_word);

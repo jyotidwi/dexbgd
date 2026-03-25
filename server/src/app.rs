@@ -6485,6 +6485,22 @@ impl App {
                     return;
                 }
                 self.log_info("Agent attached");
+                // ANR dialog may appear while app was frozen during attach.
+                // Dismiss it in background by pressing BACK (selects "Wait"),
+                // but only if the ANR dialog is actually showing.
+                std::thread::spawn(|| {
+                    std::thread::sleep(std::time::Duration::from_millis(1500));
+                    let check = std::process::Command::new("adb")
+                        .args(["shell", "dumpsys", "window", "windows"])
+                        .output();
+                    if let Ok(out) = check {
+                        if String::from_utf8_lossy(&out.stdout).contains("AppNotResponding") {
+                            let _ = std::process::Command::new("adb")
+                                .args(["shell", "input", "keyevent", "4"])
+                                .output();
+                        }
+                    }
+                });
             }
             Err(e) => {
                 self.log_error(&format!("adb failed: {}", e));
@@ -7114,7 +7130,8 @@ impl App {
             return;
         }
         if self.dex_data.is_empty() {
-            self.log_error("No DEX loaded. Use 'apk <package>' first, or connect and hit a breakpoint.");
+            let pkg = self.current_package.as_deref().unwrap_or("<package>");
+            self.log_error(&format!("No DEX loaded. Use 'apk {}' first, or connect and hit a breakpoint.", pkg));
             return;
         }
         let pat = pattern.to_lowercase();
