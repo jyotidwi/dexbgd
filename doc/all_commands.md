@@ -20,7 +20,7 @@ Aliases shown as `cmd / alias`.  `[...]` = optional.  `<...>` = required.
 | Bypass | `patch`, `anti`, `bypass-ssl`, `jni redirect` |
 | Exceptions | `excp-mute`, `excp-unmute`, `excp-mutes` |
 | Record | `record` |
-| AI | `ai` |
+| AI | `ai`, `aidec` |
 
 ---
 
@@ -403,6 +403,7 @@ ai cancel                        Cancel running analysis
 ai --claude <prompt>             Force Claude backend
 ai --ollama <prompt>             Force Ollama backend
 ai --model <model> <prompt>      Override model
+aidec                            AI-decompile current method into pseudo-Java (Decompiler tab)
 ```
 
 Examples:

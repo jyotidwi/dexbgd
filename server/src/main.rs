@@ -1,5 +1,7 @@
 mod ai;
 mod ai_claude;
+mod ai_dec_cache;
+mod ai_decompile;
 mod ai_ollama;
 mod ai_tools;
 mod app;

@@ -11,9 +11,28 @@ ai <prompt>         Full autonomy — AI runs without asking for approval
 ai ask <prompt>     Confirmation mode — AI asks before running each tool call
 ai explain <prompt> Read-only mode — AI can inspect but not change execution state
 ai cancel           Cancel a running AI session
+
+aidec               AI-decompile the currently loaded method into pseudo-Java
+ai dec              Same as aidec
 ```
 
 In `ai ask` mode, each tool call the AI wants to make is shown on screen. Press `y` to approve or `n` to deny.
+
+## AI Decompiler (`aidec`)
+
+`aidec` decompiles the currently loaded method into readable pseudo-Java and shows it in the Decompiler tab. It uses Claude to analyze the Dalvik bytecodes, infer variable/method names from context and string literals, deobfuscate where possible, and produce properly indented code with correct block structure.
+
+Results are cached in `ai_dec/<pkg>.json` next to the server binary — navigating away and back does not re-query. Run `aidec` again on a cached method to refresh it.
+
+Single-step works normally in the AI decompiled view: the `►` cursor tracks the current execution offset. Breakpoints, mouse selection, and all copy operations (Copy Sel, Copy Line, Copy View) work on the AI output.
+
+**Usage:**
+```
+dis Lcom/example/Foo; checkLicense   # load the method first
+aidec                                  # trigger AI decompile
+```
+
+Switch to the Decompiler tab to see the result. Requires `ANTHROPIC_API_KEY` to be set (Claude backend only).
 
 ## Backends
 

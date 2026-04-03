@@ -542,6 +542,243 @@ fn build_header<'a>(app: &App) -> Line<'a> {
     Line::from(spans)
 }
 
+fn java_keyword_style(word: &str, t: &crate::theme::Theme) -> Style {
+    match word {
+        // Control flow
+        "if" | "else" | "while" | "for" | "do" | "switch" | "case" | "default"
+        | "break" | "continue" | "return" | "throw" | "throws" | "try" | "catch"
+        | "finally" | "goto" => Style::default().fg(t.bc_flow),
+        // Type / modifier keywords
+        "int" | "long" | "short" | "byte" | "char" | "boolean" | "float" | "double"
+        | "void" | "new" | "null" | "true" | "false" | "this" | "super"
+        | "instanceof" | "public" | "private" | "protected" | "static" | "final"
+        | "abstract" | "synchronized" | "volatile" | "transient" | "native"
+        | "class" | "interface" | "enum" | "extends" | "implements"
+        | "import" | "package" | "var" => Style::default().fg(t.bc_opcode),
+        _ => {
+            // Capitalized identifiers = type/class names
+            if word.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
+                Style::default().fg(t.bc_reference)
+            } else {
+                Style::default().fg(t.ui_text)
+            }
+        }
+    }
+}
+
+/// Tokenise a single pseudo-Java line into styled spans.
+fn highlight_java_line(text: &str, t: &crate::theme::Theme) -> Vec<Span<'static>> {
+    // Full-line comment
+    if text.trim_start().starts_with("//") {
+        return vec![Span::styled(text.to_string(), Style::default().fg(t.ui_dim))];
+    }
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let chars: Vec<char> = text.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+
+    while i < len {
+        let c = chars[i];
+
+        // Whitespace — preserve as raw (indentation shows through)
+        if c == ' ' || c == '\t' {
+            let start = i;
+            while i < len && (chars[i] == ' ' || chars[i] == '\t') { i += 1; }
+            let s: String = chars[start..i].iter().collect();
+            spans.push(Span::raw(s));
+            continue;
+        }
+
+        // String literal
+        if c == '"' {
+            let start = i;
+            i += 1;
+            while i < len {
+                if chars[i] == '\\' { i += 2; continue; }
+                if chars[i] == '"' { i += 1; break; }
+                i += 1;
+            }
+            let s: String = chars[start..i].iter().collect();
+            spans.push(Span::styled(s, Style::default().fg(t.bc_string)));
+            continue;
+        }
+
+        // Char literal
+        if c == '\'' {
+            let start = i;
+            i += 1;
+            while i < len {
+                if chars[i] == '\\' { i += 2; continue; }
+                if chars[i] == '\'' { i += 1; break; }
+                i += 1;
+            }
+            let s: String = chars[start..i].iter().collect();
+            spans.push(Span::styled(s, Style::default().fg(t.bc_string)));
+            continue;
+        }
+
+        // Inline comment
+        if c == '/' && i + 1 < len && chars[i + 1] == '/' {
+            let s: String = chars[i..].iter().collect();
+            spans.push(Span::styled(s, Style::default().fg(t.ui_dim)));
+            break;
+        }
+
+        // Identifier / keyword
+        if c.is_alphabetic() || c == '_' {
+            let start = i;
+            while i < len && (chars[i].is_alphanumeric() || chars[i] == '_') { i += 1; }
+            let word: String = chars[start..i].iter().collect();
+            spans.push(Span::styled(word.clone(), java_keyword_style(&word, t)));
+            continue;
+        }
+
+        // Number literal (decimal, hex 0x…, float)
+        if c.is_ascii_digit() {
+            let start = i;
+            while i < len && (chars[i].is_alphanumeric() || chars[i] == '.' || chars[i] == '_') {
+                i += 1;
+            }
+            let s: String = chars[start..i].iter().collect();
+            spans.push(Span::styled(s, Style::default().fg(t.bc_number)));
+            continue;
+        }
+
+        // Braces / brackets — accent colour
+        if matches!(c, '{' | '}' | '(' | ')' | '[' | ']') {
+            spans.push(Span::styled(c.to_string(), Style::default().fg(t.ui_accent)));
+            i += 1;
+            continue;
+        }
+
+        // Operators and everything else — accumulate until next token boundary
+        let start = i;
+        while i < len {
+            let ch = chars[i];
+            if ch == ' ' || ch == '\t' || ch == '"' || ch == '\''
+                || ch.is_alphabetic() || ch == '_' || ch.is_ascii_digit()
+                || matches!(ch, '{' | '}' | '(' | ')' | '[' | ']')
+                || (ch == '/' && i + 1 < len && chars[i + 1] == '/')
+            {
+                break;
+            }
+            i += 1;
+        }
+        let s: String = chars[start..i].iter().collect();
+        spans.push(Span::styled(s, Style::default().fg(t.ui_text)));
+    }
+
+    spans
+}
+
+fn draw_ai_decompiler(
+    f: &mut Frame,
+    app: &App,
+    area: Rect,
+    block: ratatui::widgets::Block<'_>,
+    ai_lines: &[crate::ai_dec_cache::AiDecLine],
+) {
+    let inner_height = area.height.saturating_sub(2) as usize;
+    let t = &app.theme;
+    let code_height = inner_height.saturating_sub(1);
+
+    // Map current_loc to the AI line with the greatest offset <= loc.
+    // Uses max_by_key over all tagged lines so out-of-order or approximate
+    // offset tags from the AI still produce a sensible cursor position.
+    let current_ai_idx = app.current_loc.map(|loc| {
+        ai_lines.iter().enumerate()
+            .filter_map(|(i, line)| line.offset.map(|off| (i, off)))
+            .filter(|&(_, off)| off <= loc)
+            .max_by_key(|&(_, off)| off)
+            .map(|(i, _)| i)
+    }).flatten();
+
+    // Scroll: center PC in view on auto-scroll, otherwise use bytecodes_scroll as line index
+    let scroll = if app.bytecodes_auto_scroll {
+        if let Some(pc) = current_ai_idx {
+            pc.saturating_sub(code_height / 2)
+        } else {
+            0
+        }
+    } else {
+        app.bytecodes_scroll.min(ai_lines.len().saturating_sub(1))
+    };
+
+    // Selection normalization
+    let sel_full: Option<(usize, usize, usize, usize)> =
+        match (app.bytecodes_sel_anchor, app.bytecodes_sel_head) {
+            (Some(a), Some(h)) if a != h => {
+                if a.0 < h.0 || (a.0 == h.0 && a.1 <= h.1) { Some((a.0, a.1, h.0, h.1)) }
+                else { Some((h.0, h.1, a.0, a.1)) }
+            }
+            _ => None,
+        };
+    let sel_bg = t.ui_highlight_bg;
+
+    let header = build_header(app);
+    let mut lines: Vec<Line> = Vec::with_capacity(inner_height);
+    lines.push(header);
+
+    for (idx, ai_line) in ai_lines.iter().enumerate().skip(scroll).take(code_height) {
+        let is_current = current_ai_idx == Some(idx);
+
+        let has_bp = if let (Some(cls), Some(meth)) = (&app.current_class, &app.current_method) {
+            if let Some(off) = ai_line.offset {
+                app.bp_manager.breakpoints.iter().any(|bp| {
+                    bp.class == *cls && bp.method == *meth && bp.location == off
+                })
+            } else { false }
+        } else { false };
+
+        let marker = if has_bp && is_current { "\u{25cf}\u{25ba}" }
+            else if has_bp { "\u{25cf} " }
+            else if is_current { " \u{25ba}" }
+            else { "  " };
+
+        let offset_str = match ai_line.offset {
+            Some(off) => format!("{:04x} ", off),
+            None => "     ".to_string(),
+        };
+
+        const PREFIX_LEN: usize = 2 + 5; // marker(2) + offset(5)
+
+        let text_spans = highlight_java_line(&ai_line.text, t);
+
+        // Apply selection across all text spans if this line is in the selection range
+        let text_spans = if let Some((r0, c0, r1, c1)) = sel_full {
+            if idx >= r0 && idx <= r1 {
+                let sel_start = if idx == r0 { c0.saturating_sub(PREFIX_LEN) } else { 0 };
+                let sel_end   = if idx == r1 { c1.saturating_sub(PREFIX_LEN) } else { usize::MAX };
+                apply_sel_to_spans(text_spans, sel_start, sel_end, sel_bg)
+            } else {
+                text_spans
+            }
+        } else {
+            text_spans
+        };
+
+        let mut spans: Vec<Span<'static>> = vec![
+            Span::styled(marker.to_string(), if is_current { Style::default().fg(t.ui_accent) } else { Style::default().fg(t.ui_dim) }),
+            Span::styled(offset_str,          Style::default().fg(t.ui_dim)),
+        ];
+        spans.extend(text_spans);
+
+        lines.push(Line::from(spans));
+    }
+
+    // Pending indicator when aidec is running
+    if app.ai_dec_rx.is_some() {
+        lines.push(Line::from(Span::styled(
+            "  [AI decompiling...]",
+            Style::default().fg(t.ui_dim),
+        )));
+    }
+
+    let para = Paragraph::new(lines).block(block);
+    f.render_widget(para, area);
+}
+
 fn draw_decompiler(f: &mut Frame, app: &App, area: Rect, block: ratatui::widgets::Block<'_>) {
     let inner_height = area.height.saturating_sub(2) as usize;
     let t = &app.theme;
@@ -551,6 +788,19 @@ fn draw_decompiler(f: &mut Frame, app: &App, area: Rect, block: ratatui::widgets
             .block(block)
             .style(Style::default().fg(t.ui_dim));
         f.render_widget(text, area);
+        return;
+    }
+
+    // Check AI decompile cache for the current method
+    let ai_dec_key = match (&app.current_class, &app.current_method) {
+        (Some(c), Some(m)) => Some(crate::ai_dec_cache::AiDecCache::method_key(c, m)),
+        _ => None,
+    };
+    let ai_lines = ai_dec_key.as_deref()
+        .and_then(|k| app.ai_dec_cache.methods.get(k));
+
+    if let Some(ai_lines) = ai_lines {
+        draw_ai_decompiler(f, app, area, block, ai_lines);
         return;
     }
 

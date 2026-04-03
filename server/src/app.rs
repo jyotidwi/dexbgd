@@ -596,6 +596,10 @@ pub struct App {
     pub ai_line_buf: String, // partial line buffer for streaming text deltas
     pub ai_req_tx: Option<mpsc::Sender<AiRequest>>,
     pub ai_evt_rx: Option<mpsc::Receiver<AiEvent>>,
+    /// AI decompile cache for the connected package (loaded on connect).
+    pub ai_dec_cache: crate::ai_dec_cache::AiDecCache,
+    /// One-shot channel receiving result of a background aidec call.
+    pub ai_dec_rx: Option<mpsc::Receiver<Result<Vec<crate::ai_dec_cache::AiDecLine>, String>>>,
     pub ai_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     pub ai_pending_tool_call: Option<(String, String)>, // (tool_use_id, description)
     pub ai_pending_tool_input: Option<(String, serde_json::Value)>, // (name, input) for Ask mode
@@ -781,6 +785,8 @@ impl App {
             ai_line_buf: String::new(),
             ai_req_tx: None,
             ai_evt_rx: None,
+            ai_dec_cache: crate::ai_dec_cache::AiDecCache::default(),
+            ai_dec_rx: None,
             ai_cancel: None,
             ai_pending_tool_call: None,
             ai_pending_tool_input: None,
@@ -853,6 +859,7 @@ impl App {
 
         // Process AI events (non-blocking)
         self.poll_ai_events();
+        self.poll_ai_dec_result();
 
 
         // Process terminal events
@@ -946,6 +953,7 @@ impl App {
                 if let Some(pkg) = package_name {
                     self.current_package = Some(pkg.clone());
                     self.load_session(&pkg);
+                    self.ai_dec_cache = crate::ai_dec_cache::AiDecCache::load(&pkg);
                 }
                 // Auto-refresh thread list on connect
                 self.send_command(OutboundCommand::Threads {});
@@ -3524,9 +3532,20 @@ impl App {
                 self.copy_decompiler_selection();
             }
             "Copy Line" => {
-                let raw_idx = raw_idx_for_decompiled(&self.bytecodes, menu.line_idx);
-                if let Some(instr) = self.bytecodes.get(raw_idx) {
-                    copy_to_clipboard(&format!("{:04x}: {}", instr.offset, instr.text));
+                let ai_key = match (&self.current_class, &self.current_method) {
+                    (Some(c), Some(m)) => Some(crate::ai_dec_cache::AiDecCache::method_key(c, m)),
+                    _ => None,
+                };
+                if let Some(line) = ai_key.as_deref()
+                    .and_then(|k| self.ai_dec_cache.methods.get(k))
+                    .and_then(|ls| ls.get(menu.line_idx))
+                {
+                    copy_to_clipboard(&line.text);
+                } else {
+                    let raw_idx = raw_idx_for_decompiled(&self.bytecodes, menu.line_idx);
+                    if let Some(instr) = self.bytecodes.get(raw_idx) {
+                        copy_to_clipboard(&format!("{:04x}: {}", instr.offset, instr.text));
+                    }
                 }
             }
             "Copy View" => {
@@ -3569,6 +3588,27 @@ impl App {
         } else {
             (head.0, head.1, anchor.0, anchor.1)
         };
+
+        // Use AI dec cache if available
+        let ai_key = match (&self.current_class, &self.current_method) {
+            (Some(c), Some(m)) => Some(crate::ai_dec_cache::AiDecCache::method_key(c, m)),
+            _ => None,
+        };
+        if let Some(ai_lines) = ai_key.as_deref().and_then(|k| self.ai_dec_cache.methods.get(k)) {
+            let mut parts: Vec<String> = Vec::new();
+            for row in r0..=r1 {
+                if let Some(line) = ai_lines.get(row) {
+                    let chars: Vec<char> = line.text.chars().collect();
+                    let start = if row == r0 { c0.min(chars.len()) } else { 0 };
+                    let end   = if row == r1 { c1.min(chars.len()) } else { chars.len() };
+                    let (start, end) = (start.min(end), start.max(end));
+                    parts.push(chars[start..end].iter().collect());
+                }
+            }
+            copy_to_clipboard(&parts.join("\n"));
+            return;
+        }
+
         let decompiled: Vec<(u32, String)> = self.bytecodes.iter()
             .filter(|i| !is_decompiler_noise(&i.text))
             .map(|i| (i.offset, i.text.clone()))
@@ -3592,6 +3632,24 @@ impl App {
         let code_height = self.layout_geom.as_ref()
             .map(|g| g.bytecodes_area.height.saturating_sub(3) as usize)
             .unwrap_or(20);
+
+        // Use AI dec cache if available for the current method
+        let ai_key = match (&self.current_class, &self.current_method) {
+            (Some(c), Some(m)) => Some(crate::ai_dec_cache::AiDecCache::method_key(c, m)),
+            _ => None,
+        };
+        if let Some(ai_lines) = ai_key.as_deref().and_then(|k| self.ai_dec_cache.methods.get(k)) {
+            let scroll = self.bytecodes_scroll.min(ai_lines.len().saturating_sub(1));
+            let text: String = ai_lines.iter()
+                .skip(scroll)
+                .take(code_height)
+                .map(|l| l.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            copy_to_clipboard(&text);
+            return;
+        }
+
         let base_dec = if self.bytecodes.is_empty() { 0 } else {
             decompiled_idx_of(&self.bytecodes,
                 self.bytecodes_scroll.min(self.bytecodes.len().saturating_sub(1)))
@@ -5394,6 +5452,10 @@ impl App {
         // AI commands
         if input == "ai cancel" {
             self.do_ai_cancel();
+            return;
+        }
+        if input == "aidec" || input == "ai dec" {
+            self.do_ai_dec();
             return;
         }
         if input.starts_with("ai ") || input == "ai" {
@@ -8051,6 +8113,56 @@ impl App {
     }
 
     // -------------------------------------------------------------------
+    // AI decompiler
+    // -------------------------------------------------------------------
+
+    fn do_ai_dec(&mut self) {
+        let cls = match &self.current_class {
+            Some(c) => c.clone(),
+            None => { self.log_error("aidec: no method loaded - run 'dis' first"); return; }
+        };
+        let meth = match &self.current_method {
+            Some(m) => m.clone(),
+            None => { self.log_error("aidec: no method loaded - run 'dis' first"); return; }
+        };
+        if self.bytecodes.is_empty() {
+            self.log_error("aidec: no bytecodes loaded");
+            return;
+        }
+        if self.ai_dec_rx.is_some() {
+            self.log_error("aidec: already running, please wait");
+            return;
+        }
+
+        // Check if already cached
+        let key = crate::ai_dec_cache::AiDecCache::method_key(&cls, &meth);
+        if self.ai_dec_cache.methods.contains_key(&key) {
+            self.log_info("aidec: already cached - switch to Decompiler tab to view (run 'aidec' again to refresh)");
+            // Remove to force refresh
+            self.ai_dec_cache.methods.remove(&key);
+        }
+
+        let api_key = match std::env::var("ANTHROPIC_API_KEY") {
+            Ok(k) if !k.is_empty() => k,
+            _ => { self.log_error("aidec: ANTHROPIC_API_KEY not set"); return; }
+        };
+        let model = self.config.ai.claude_model.clone();
+        let bytecodes = self.bytecodes.clone();
+        let (tx, rx) = mpsc::channel();
+        self.ai_dec_rx = Some(rx);
+
+        let short = crate::commands::short_class(&cls);
+        self.log_info(&format!("aidec: decompiling {}.{}...", short, meth));
+
+        std::thread::spawn(move || {
+            let result = crate::ai_decompile::ai_decompile_method(
+                &api_key, &model, &cls, &meth, &bytecodes,
+            );
+            let _ = tx.send(result);
+        });
+    }
+
+    // -------------------------------------------------------------------
     // AI analysis agent
     // -------------------------------------------------------------------
 
@@ -8316,6 +8428,41 @@ impl App {
             self.handle_ai_event(evt);
         }
     }
+
+    fn poll_ai_dec_result(&mut self) {
+        let result = if let Some(rx) = &self.ai_dec_rx {
+            match rx.try_recv() {
+                Ok(r) => { self.ai_dec_rx = None; Some(r) }
+                Err(mpsc::TryRecvError::Empty) => None,
+                Err(mpsc::TryRecvError::Disconnected) => { self.ai_dec_rx = None; None }
+            }
+        } else {
+            None
+        };
+
+        if let Some(outcome) = result {
+            match outcome {
+                Ok(lines) => {
+                    let (cls, meth) = match (&self.current_class, &self.current_method) {
+                        (Some(c), Some(m)) => (c.clone(), m.clone()),
+                        _ => { self.log_error("aidec: method navigated away before result arrived"); return; }
+                    };
+                    let key = crate::ai_dec_cache::AiDecCache::method_key(&cls, &meth);
+                    self.ai_dec_cache.methods.insert(key, lines);
+                    if let Some(pkg) = &self.current_package.clone() {
+                        if let Err(e) = self.ai_dec_cache.save(pkg) {
+                            self.log_error(&format!("aidec: cache save failed: {}", e));
+                        }
+                    }
+                    self.log_info("aidec: decompile complete - switch to Decompiler tab to view");
+                }
+                Err(e) => {
+                    self.log_error(&format!("aidec: {}", e));
+                }
+            }
+        }
+    }
+
 
     fn handle_ai_event(&mut self, evt: AiEvent) {
         match evt {
