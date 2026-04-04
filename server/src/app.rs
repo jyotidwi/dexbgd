@@ -8716,6 +8716,13 @@ impl App {
     fn handle_ai_event(&mut self, evt: AiEvent) {
         match evt {
             AiEvent::TextDelta(text) => {
+                // Insert blank separator when transitioning from tool output back to AI text
+                if self.ai_line_buf.is_empty() {
+                    let last_kind = self.ai_output.last().map(|l| l.kind);
+                    if matches!(last_kind, Some(AiLineKind::ToolCall) | Some(AiLineKind::ToolResult)) {
+                        self.ai_output.push(AiOutputLine { kind: AiLineKind::Text, text: String::new() });
+                    }
+                }
                 // Accumulate into line buffer; only push complete lines (ending in \n).
                 self.ai_line_buf.push_str(&text);
                 while let Some(nl) = self.ai_line_buf.find('\n') {

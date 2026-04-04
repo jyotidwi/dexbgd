@@ -71,7 +71,7 @@ impl LlmClient for ClaudeClient {
                 if attempt > 0 {
                     let wait_secs = 15u64 * (1 << (attempt - 1)); // 15, 30, 60
                     let _ = delta_tx.send(AiEvent::TextDelta(format!(
-                        "[Rate limit - waiting {}s before retry {}/3...]\n", wait_secs, attempt
+                        "[Rate limit - waiting {}s before retry {}/3... use 'ai cancel' to stop]\n", wait_secs, attempt
                     )));
                     // Sleep in small increments so cancel is checked
                     let steps = wait_secs * 2;
