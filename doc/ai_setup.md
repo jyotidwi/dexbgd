@@ -107,6 +107,23 @@ turn_delay_ms=0           # milliseconds to wait between turns (0 = no delay)
 > ai explain What is this method doing? (cursor on a deobfuscated method)
 ```
 
+### Autonomous root detection bypass
+
+```
+> ai scan for root detection using strings and xref, anti bypass each found method, then continue the app
+```
+
+For apps with dynamic checks not caught by static scan:
+
+```
+> ai set bp-detect profile, continue app, anti bypass each triggered method, repeat until app runs
+```
+
+**Notes:**
+- `anti` is preferred over `bp` + `force_return` — sets a persistent silent hook
+- Native (JNI) root checks cannot be hooked
+- Checks in `<clinit>` or `Application.onCreate()` may run before agent attaches
+
 ## Tips
 
 - Start with `ai explain` or `ai ask` while getting familiar — full autonomy can set many breakpoints quickly
