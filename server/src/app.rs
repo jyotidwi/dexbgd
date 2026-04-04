@@ -9073,6 +9073,43 @@ impl App {
                     )
                 }
             }
+            "follow_method" => {
+                // Parse class+method from either a full JNI ref or separate fields.
+                // JNI ref form: "Lcom/example/Foo;->methodName(params)RetType"
+                let (jni_class, method_name) = if let Some(ref_str) = input.get("method_ref").and_then(|v| v.as_str()) {
+                    parse_jni_method_ref(ref_str)
+                } else {
+                    let class = input.get("class").and_then(|v| v.as_str()).unwrap_or("");
+                    let method = input.get("method").and_then(|v| v.as_str()).unwrap_or("");
+                    (to_jni_class(class), method.to_string())
+                };
+
+                if jni_class.is_empty() || method_name.is_empty() {
+                    return "follow_method: provide method_ref or both class and method".into();
+                }
+
+                // Dot-form class for the dis command
+                let dot_class = jni_to_dot(&jni_class);
+
+                // Get bytecode disassembly
+                let dis_result = self.execute_tool_as_command(&format!("dis {} {}", dot_class, method_name));
+
+                // Get cached AI decompilation if available
+                let key = crate::ai_dec_cache::AiDecCache::method_key(&jni_class, &method_name);
+                let dec_result = if let Some(lines) = self.ai_dec_cache.methods.get(&key) {
+                    let mut s = format!("\n// AI decompiled: {}.{}\n", short_class(&jni_class), method_name);
+                    for line in lines {
+                        s.push_str(&line.text);
+                        s.push('\n');
+                    }
+                    s
+                } else {
+                    format!("\n// No AI decompilation cached for {}.{} (run: aidec {} {})",
+                        short_class(&jni_class), method_name, dot_class, method_name)
+                };
+
+                format!("{}{}", dis_result, dec_result)
+            }
             "get_xref_callers" => {
                 let class = input.get("class").and_then(|v| v.as_str()).unwrap_or("");
                 let method = input.get("method").and_then(|v| v.as_str()).unwrap_or("");
@@ -9162,6 +9199,32 @@ fn to_jni_class(class: &str) -> String {
         class.to_string()
     } else {
         format!("L{};", class.replace('.', "/"))
+    }
+}
+
+/// Convert JNI class sig to dot form: "Lcom/test/Foo;" -> "com.test.Foo"
+fn jni_to_dot(jni: &str) -> String {
+    let inner = jni.strip_prefix('L').unwrap_or(jni);
+    let inner = inner.strip_suffix(';').unwrap_or(inner);
+    inner.replace('/', ".")
+}
+
+/// Parse a full JNI method reference into (jni_class, method_name).
+/// "Lcom/example/Foo;->bar(I)V" -> ("Lcom/example/Foo;", "bar")
+/// Strips the proto signature from the method name.
+fn parse_jni_method_ref(s: &str) -> (String, String) {
+    if let Some(arrow) = s.find("->") {
+        let class = s[..arrow].to_string();
+        let rest = &s[arrow + 2..];
+        // Strip proto: everything from '(' onwards
+        let method = if let Some(p) = rest.find('(') {
+            rest[..p].to_string()
+        } else {
+            rest.to_string()
+        };
+        (class, method)
+    } else {
+        (String::new(), String::new())
     }
 }
 

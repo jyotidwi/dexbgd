@@ -183,6 +183,19 @@ pub fn all_tools() -> Vec<ToolDef> {
             }),
             is_execution: false,
         },
+        ToolDef {
+            name: "follow_method",
+            description: "Navigate to a method and return its disassembly plus cached AI decompilation if available. Accepts a full JNI method reference (from dis output) or separate class/method. Use to drill into a method seen in an invoke instruction without manually parsing the JNI signature.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "method_ref": { "type": "string", "description": "Full JNI method ref from dis output, e.g. 'Lcom/example/Foo;->bar(I)V'" },
+                    "class": { "type": "string", "description": "Class name (dot or JNI form), used when method_ref is not provided" },
+                    "method": { "type": "string", "description": "Method name, used when method_ref is not provided" }
+                }
+            }),
+            is_execution: false,
+        },
 
         // ---------------------------------------------------------------
         // Execution tools (9)  - gated by mode
