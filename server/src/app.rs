@@ -1358,15 +1358,38 @@ impl App {
                         .unwrap_or(20);
                     if let Some(new_idx) = self.bytecodes.iter().position(|i| i.offset == location as u32) {
                         if self.left_tab == LeftTab::Decompiler {
-                            // Check visibility in decompiled (filtered) space so that the ►
-                            // walks all the way to the last visible line before the view jumps,
-                            // and lands with 2 context lines above — same feel as Bytecodes tab.
-                            let pc_dec = decompiled_idx_of(&self.bytecodes, new_idx);
-                            let base_dec = decompiled_idx_of(&self.bytecodes,
-                                self.bytecodes_scroll.min(self.bytecodes.len().saturating_sub(1)));
-                            let visible = pc_dec >= base_dec && pc_dec < base_dec + code_height.max(1);
-                            if !visible {
-                                self.bytecodes_scroll = raw_idx_for_decompiled(&self.bytecodes, pc_dec.saturating_sub(2));
+                            // Check if AI dec is active for this method
+                            let ai_dec_key = match (&self.current_class, &self.current_method) {
+                                (Some(c), Some(m)) => Some(crate::ai_dec_cache::AiDecCache::method_key(c, m)),
+                                _ => None,
+                            };
+                            let ai_lines = ai_dec_key.as_deref()
+                                .and_then(|k| self.ai_dec_cache.methods.get(k));
+
+                            if let Some(ai_lines) = ai_lines {
+                                // AI dec: find PC in AI line space, check visibility there
+                                let ai_idx = ai_lines.iter().enumerate()
+                                    .filter_map(|(i, l)| l.offset.map(|off| (i, off)))
+                                    .filter(|&(_, off)| off <= location)
+                                    .max_by_key(|&(_, off)| off)
+                                    .map(|(i, _)| i);
+                                if let Some(ai_idx) = ai_idx {
+                                    let scroll = self.bytecodes_scroll;
+                                    let visible = ai_idx >= scroll && ai_idx < scroll + code_height.max(1);
+                                    if !visible {
+                                        self.bytecodes_scroll = ai_idx.saturating_sub(2);
+                                    }
+                                }
+                            } else {
+                                // Primitive decompiler: check visibility in filtered space so ►
+                                // walks to the last visible line before the view jumps.
+                                let pc_dec = decompiled_idx_of(&self.bytecodes, new_idx);
+                                let base_dec = decompiled_idx_of(&self.bytecodes,
+                                    self.bytecodes_scroll.min(self.bytecodes.len().saturating_sub(1)));
+                                let visible = pc_dec >= base_dec && pc_dec < base_dec + code_height.max(1);
+                                if !visible {
+                                    self.bytecodes_scroll = raw_idx_for_decompiled(&self.bytecodes, pc_dec.saturating_sub(2));
+                                }
                             }
                         } else {
                             let visible = new_idx >= self.bytecodes_scroll

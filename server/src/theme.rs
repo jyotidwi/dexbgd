@@ -104,7 +104,7 @@ pub fn solarized() -> Theme {
         ui_dim: Color::Rgb(88, 110, 117),        // base01
         ui_value: Color::Rgb(181, 137, 0),       // yellow
         ui_cursor_bg: Color::Rgb(7, 54, 66),     // base02
-        ui_current_bg: Color::Rgb(0, 43, 54),    // base03
+        ui_current_bg: Color::Rgb(0, 80, 102),   // brighter teal, visible against base03
         ui_highlight_bg: Color::Rgb(40, 60, 50),
         ui_breakpoint: Color::Rgb(220, 50, 47),  // red
         ui_bg: Color::Rgb(0, 43, 54),             // base03 #002b36

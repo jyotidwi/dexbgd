@@ -743,7 +743,18 @@ fn draw_ai_decompiler(
 
         const PREFIX_LEN: usize = 2 + 5; // marker(2) + offset(5)
 
+        let line_bg = if is_current { t.ui_current_bg } else { t.ui_bg };
+
         let text_spans = highlight_java_line(&ai_line.text, t);
+
+        // Apply current-line background to text spans before selection overlay
+        let text_spans: Vec<Span<'static>> = if is_current {
+            text_spans.into_iter()
+                .map(|s| Span::styled(s.content.into_owned(), s.style.bg(line_bg)))
+                .collect()
+        } else {
+            text_spans
+        };
 
         // Apply selection across all text spans if this line is in the selection range
         let text_spans = if let Some((r0, c0, r1, c1)) = sel_full {
@@ -759,8 +770,8 @@ fn draw_ai_decompiler(
         };
 
         let mut spans: Vec<Span<'static>> = vec![
-            Span::styled(marker.to_string(), if is_current { Style::default().fg(t.ui_accent) } else { Style::default().fg(t.ui_dim) }),
-            Span::styled(offset_str,          Style::default().fg(t.ui_dim)),
+            Span::styled(marker.to_string(), if is_current { Style::default().fg(t.ui_accent).bg(line_bg) } else { Style::default().fg(t.ui_dim) }),
+            Span::styled(offset_str, Style::default().fg(t.ui_dim).bg(line_bg)),
         ];
         spans.extend(text_spans);
 
