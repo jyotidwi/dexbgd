@@ -395,6 +395,13 @@ jni restore 0x7a3f2b10
 
 Restore requires the original pointer to have been captured by `jni monitor` first.
 
+> **`jni monitor` shows nothing?** The method may use static JNI naming (`Java_com_example_ClassName_methodName`) instead of `RegisterNatives` — the JVM resolves the pointer automatically by symbol lookup, so no `RegisterNatives` call fires. You can still redirect by class/method/sig directly:
+> ```
+> # Symbol: Java_com_example_ClassName_methodName
+> jni redirect Lcom/example/ClassName; methodName ()Z false
+> ```
+> The redirect works regardless of how the native pointer was registered.
+
 **Typical workflow for a native protector:**
 
 ```
