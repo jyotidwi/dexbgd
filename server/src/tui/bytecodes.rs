@@ -775,6 +775,26 @@ fn draw_ai_decompiler(
         ];
         spans.extend(text_spans);
 
+        if let Some(ref hw) = app.bytecodes_highlight {
+            apply_highlight(&mut spans, hw, t.ui_highlight_bg);
+        }
+
+        // Brace-pair highlight: color matched { } in red+bold
+        if let Some((b_open, b_close)) = app.ai_dec_brace_pair {
+            let brace_target = if idx == b_open { '{' } else if idx == b_close { '}' } else { '\0' };
+            if brace_target != '\0' {
+                let t_str = brace_target.to_string();
+                for span in spans.iter_mut() {
+                    if span.content == t_str {
+                        span.style = span.style
+                            .fg(t.ui_bg)
+                            .bg(t.ui_breakpoint)
+                            .add_modifier(ratatui::style::Modifier::BOLD);
+                    }
+                }
+            }
+        }
+
         lines.push(Line::from(spans));
     }
 

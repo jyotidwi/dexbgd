@@ -407,6 +407,7 @@ pub struct App {
     pub stepping_since: Option<std::time::Instant>,  // timeout safety for stuck STEPPING
     pub stepping_quiet: bool,  // suppress verbose logs during step sequences
     pub bytecodes_highlight: Option<String>,  // word to highlight in all occurrences
+    pub ai_dec_brace_pair: Option<(usize, usize)>, // matched { } line indices in AI dec view
     pub current_loc: Option<i64>,
     pub current_class: Option<String>,
     pub current_method: Option<String>,
@@ -682,6 +683,7 @@ impl App {
             stepping_since: None,
             stepping_quiet: false,
             bytecodes_highlight: None,
+            ai_dec_brace_pair: None,
             current_loc: None,
             current_class: None,
             current_method: None,
@@ -1063,6 +1065,7 @@ impl App {
                         self.current_bytecode_bytes = bytes;
                         self.bytecodes = instructions;
                         self.bytecodes_highlight = None;
+                        self.ai_dec_brace_pair = None;
                         self.bytecodes_cursor = None;
                         self.current_loc = current_loc;
 
@@ -2217,27 +2220,87 @@ impl App {
                         if self.left_tab == LeftTab::Decompiler && !self.bytecodes.is_empty() {
                             let inner_y = (row.saturating_sub(ba.y + 1)) as usize;
                             if inner_y > 0 {
-                                let base_dec = decompiled_idx_of(&self.bytecodes,
-                                    self.bytecodes_scroll.min(self.bytecodes.len().saturating_sub(1)));
-                                let dec_len = self.bytecodes.iter()
-                                    .filter(|i| !crate::tui::bytecodes::is_decompiler_noise(&i.text))
-                                    .count();
-                                let dec_idx = (base_dec + (inner_y - 1)).min(dec_len.saturating_sub(1));
                                 let click_col = col.saturating_sub(ba.x + 1) as usize;
-                                self.bytecodes_sel_anchor = Some((dec_idx, click_col));
-                                self.bytecodes_sel_head = Some((dec_idx, click_col));
-                                self.drag = DragTarget::BytecodesArea;
-                                let raw_idx = raw_idx_for_decompiled(&self.bytecodes, dec_idx);
-                                if let Some(instr) = self.bytecodes.get(raw_idx) {
-                                    // Build flat decompiled text so word_at_col matches span contents.
-                                    // Format: "  XXXX " (7 chars) + concatenated span text.
-                                    let first_word = instr.text.split_whitespace().next().unwrap_or("");
-                                    let (spans, _) = crate::tui::bytecodes::decompile_instruction(
-                                        &instr.text, first_word, &self.theme);
-                                    let mut flat = format!("  {:04x} ", instr.offset);
-                                    for s in &spans { flat.push_str(&s.content); }
-                                    self.bytecodes_highlight = word_at_col(&flat, click_col)
-                                        .map(|w| w.to_string());
+
+                                // Check if AI dec is active — if so use AI line space
+                                let ai_dec_key = match (&self.current_class, &self.current_method) {
+                                    (Some(c), Some(m)) => Some(crate::ai_dec_cache::AiDecCache::method_key(c, m)),
+                                    _ => None,
+                                };
+                                let ai_click: Option<(usize, Option<String>)> = {
+                                    let ai_lines = ai_dec_key.as_deref()
+                                        .and_then(|k| self.ai_dec_cache.methods.get(k));
+                                    if let Some(ai_lines) = ai_lines {
+                                        let code_height = ba.height.saturating_sub(3) as usize;
+                                        let current_ai_idx = self.current_loc.and_then(|loc| {
+                                            ai_lines.iter().enumerate()
+                                                .filter_map(|(i, l)| l.offset.map(|off| (i, off)))
+                                                .filter(|&(_, off)| off <= loc)
+                                                .max_by_key(|&(_, off)| off)
+                                                .map(|(i, _)| i)
+                                        });
+                                        let scroll = if self.bytecodes_auto_scroll {
+                                            current_ai_idx.map(|pc| pc.saturating_sub(code_height / 2)).unwrap_or(0)
+                                        } else {
+                                            self.bytecodes_scroll.min(ai_lines.len().saturating_sub(1))
+                                        };
+                                        let ai_idx = (scroll + (inner_y - 1)).min(ai_lines.len().saturating_sub(1));
+                                        let flat = ai_lines.get(ai_idx).map(|l| match l.offset {
+                                            Some(off) => format!("  {:04x} {}", off, l.text),
+                                            None      => format!("       {}", l.text),
+                                        });
+                                        Some((ai_idx, flat))
+                                    } else {
+                                        None
+                                    }
+                                };
+
+                                if let Some((ai_idx, flat)) = ai_click {
+                                    let clicked_char = flat.as_deref()
+                                        .and_then(|f| f.as_bytes().get(click_col).copied())
+                                        .map(|b| b as char)
+                                        .unwrap_or(' ');
+                                    if clicked_char == '{' || clicked_char == '}' {
+                                        // Brace match: find partner line, clear word highlight
+                                        self.bytecodes_highlight = None;
+                                        let brace_pair = {
+                                            let ai_lines = ai_dec_key.as_deref()
+                                                .and_then(|k| self.ai_dec_cache.methods.get(k));
+                                            ai_lines.and_then(|lines| {
+                                                find_ai_brace_match(lines, ai_idx, clicked_char)
+                                            })
+                                        };
+                                        self.ai_dec_brace_pair = brace_pair;
+                                    } else {
+                                        self.ai_dec_brace_pair = None;
+                                        self.bytecodes_highlight = flat.as_deref()
+                                            .and_then(|f| java_word_at_col(f, click_col))
+                                            .map(|w| w.to_string());
+                                    }
+                                    self.bytecodes_sel_anchor = Some((ai_idx, click_col));
+                                    self.bytecodes_sel_head = Some((ai_idx, click_col));
+                                    self.drag = DragTarget::BytecodesArea;
+                                } else {
+                                    // Primitive decompiler
+                                    let base_dec = decompiled_idx_of(&self.bytecodes,
+                                        self.bytecodes_scroll.min(self.bytecodes.len().saturating_sub(1)));
+                                    let dec_len = self.bytecodes.iter()
+                                        .filter(|i| !crate::tui::bytecodes::is_decompiler_noise(&i.text))
+                                        .count();
+                                    let dec_idx = (base_dec + (inner_y - 1)).min(dec_len.saturating_sub(1));
+                                    self.bytecodes_sel_anchor = Some((dec_idx, click_col));
+                                    self.bytecodes_sel_head = Some((dec_idx, click_col));
+                                    self.drag = DragTarget::BytecodesArea;
+                                    let raw_idx = raw_idx_for_decompiled(&self.bytecodes, dec_idx);
+                                    if let Some(instr) = self.bytecodes.get(raw_idx) {
+                                        let first_word = instr.text.split_whitespace().next().unwrap_or("");
+                                        let (spans, _) = crate::tui::bytecodes::decompile_instruction(
+                                            &instr.text, first_word, &self.theme);
+                                        let mut flat = format!("  {:04x} ", instr.offset);
+                                        for s in &spans { flat.push_str(&s.content); }
+                                        self.bytecodes_highlight = word_at_col(&flat, click_col)
+                                            .map(|w| w.to_string());
+                                    }
                                 }
                             }
                         } else if self.left_tab == LeftTab::Ai && !self.ai_output.is_empty() {
@@ -2431,13 +2494,43 @@ impl App {
                                 if inner_y > 0 {
                                     let drag_c = col.saturating_sub(ba.x + 1) as usize;
                                     if self.left_tab == LeftTab::Decompiler {
-                                        let base_dec = decompiled_idx_of(&self.bytecodes,
-                                            self.bytecodes_scroll.min(self.bytecodes.len().saturating_sub(1)));
-                                        let dec_len = self.bytecodes.iter()
-                                            .filter(|i| !crate::tui::bytecodes::is_decompiler_noise(&i.text))
-                                            .count();
-                                        let dec_idx = (base_dec + (inner_y - 1)).min(dec_len.saturating_sub(1));
-                                        self.bytecodes_sel_head = Some((dec_idx, drag_c));
+                                        let ai_dec_key = match (&self.current_class, &self.current_method) {
+                                            (Some(c), Some(m)) => Some(crate::ai_dec_cache::AiDecCache::method_key(c, m)),
+                                            _ => None,
+                                        };
+                                        let ai_drag_idx: Option<usize> = {
+                                            let ai_lines = ai_dec_key.as_deref()
+                                                .and_then(|k| self.ai_dec_cache.methods.get(k));
+                                            if let Some(ai_lines) = ai_lines {
+                                                let code_height = ba.height.saturating_sub(3) as usize;
+                                                let current_ai_idx = self.current_loc.and_then(|loc| {
+                                                    ai_lines.iter().enumerate()
+                                                        .filter_map(|(i, l)| l.offset.map(|off| (i, off)))
+                                                        .filter(|&(_, off)| off <= loc)
+                                                        .max_by_key(|&(_, off)| off)
+                                                        .map(|(i, _)| i)
+                                                });
+                                                let scroll = if self.bytecodes_auto_scroll {
+                                                    current_ai_idx.map(|pc| pc.saturating_sub(code_height / 2)).unwrap_or(0)
+                                                } else {
+                                                    self.bytecodes_scroll.min(ai_lines.len().saturating_sub(1))
+                                                };
+                                                Some((scroll + (inner_y - 1)).min(ai_lines.len().saturating_sub(1)))
+                                            } else {
+                                                None
+                                            }
+                                        };
+                                        if let Some(ai_idx) = ai_drag_idx {
+                                            self.bytecodes_sel_head = Some((ai_idx, drag_c));
+                                        } else {
+                                            let base_dec = decompiled_idx_of(&self.bytecodes,
+                                                self.bytecodes_scroll.min(self.bytecodes.len().saturating_sub(1)));
+                                            let dec_len = self.bytecodes.iter()
+                                                .filter(|i| !crate::tui::bytecodes::is_decompiler_noise(&i.text))
+                                                .count();
+                                            let dec_idx = (base_dec + (inner_y - 1)).min(dec_len.saturating_sub(1));
+                                            self.bytecodes_sel_head = Some((dec_idx, drag_c));
+                                        }
                                     } else {
                                         let scroll = self.effective_bytecodes_scroll(ba.height);
                                         let bc_idx = (scroll + (inner_y - 1))
@@ -3618,12 +3711,15 @@ impl App {
             _ => None,
         };
         if let Some(ai_lines) = ai_key.as_deref().and_then(|k| self.ai_dec_cache.methods.get(k)) {
+            // c0/c1 are rendered display columns; subtract prefix (marker 2 + offset 5 = 7)
+            // to get character positions within line.text, matching the renderer's PREFIX_LEN.
+            const PREFIX_LEN: usize = 7;
             let mut parts: Vec<String> = Vec::new();
             for row in r0..=r1 {
                 if let Some(line) = ai_lines.get(row) {
                     let chars: Vec<char> = line.text.chars().collect();
-                    let start = if row == r0 { c0.min(chars.len()) } else { 0 };
-                    let end   = if row == r1 { c1.min(chars.len()) } else { chars.len() };
+                    let start = if row == r0 { c0.saturating_sub(PREFIX_LEN).min(chars.len()) } else { 0 };
+                    let end   = if row == r1 { c1.saturating_sub(PREFIX_LEN).min(chars.len()) } else { chars.len() };
                     let (start, end) = (start.min(end), start.max(end));
                     parts.push(chars[start..end].iter().collect());
                 }
@@ -8937,6 +9033,75 @@ fn split_long_line(line: &str, max_width: usize) -> Vec<String> {
 fn is_primitive_type(var_type: &str) -> bool {
     matches!(var_type.chars().next(),
         Some('I' | 'J' | 'F' | 'D' | 'Z' | 'B' | 'S' | 'C' | '?'))
+}
+
+/// Find the matching brace line in AI dec output.
+/// Returns (open_line_idx, close_line_idx).
+fn find_ai_brace_match(
+    ai_lines: &[crate::ai_dec_cache::AiDecLine],
+    clicked_idx: usize,
+    brace: char,
+) -> Option<(usize, usize)> {
+    if brace == '{' {
+        let mut depth = 1i32;
+        for (idx, line) in ai_lines.iter().enumerate().skip(clicked_idx + 1) {
+            for ch in line.text.chars() {
+                if ch == '{' { depth += 1; }
+                else if ch == '}' {
+                    depth -= 1;
+                    if depth == 0 { return Some((clicked_idx, idx)); }
+                }
+            }
+        }
+    } else {
+        let mut depth = 1i32;
+        for idx in (0..clicked_idx).rev() {
+            for ch in ai_lines[idx].text.chars().rev() {
+                if ch == '}' { depth += 1; }
+                else if ch == '{' {
+                    depth -= 1;
+                    if depth == 0 { return Some((idx, clicked_idx)); }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Like word_at_col but uses Java identifier rules (alphanumeric + _ + $).
+/// Used for AI decompiler highlighting so [0], (), . don't bleed into the token.
+fn java_word_at_col<'a>(line: &'a str, col: usize) -> Option<&'a str> {
+    if col >= line.len() { return None; }
+    let bytes = line.as_bytes();
+
+    // Clicking inside a quoted string returns the whole quoted literal
+    let mut in_quote = false;
+    let mut quote_start = 0;
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'"' {
+            if in_quote {
+                if col >= quote_start && col <= i {
+                    return Some(&line[quote_start..=i]);
+                }
+                in_quote = false;
+            } else {
+                in_quote = true;
+                quote_start = i;
+            }
+        }
+    }
+
+    // Otherwise extract a Java identifier: [A-Za-z0-9_$]+
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$';
+    if !is_ident(bytes[col]) { return None; }
+
+    let mut start = col;
+    while start > 0 && is_ident(bytes[start - 1]) { start -= 1; }
+    let mut end = col + 1;
+    while end < bytes.len() && is_ident(bytes[end]) { end += 1; }
+
+    let word = &line[start..end];
+    if word.is_empty() { None } else { Some(word) }
 }
 
 fn word_at_col<'a>(line: &'a str, col: usize) -> Option<&'a str> {
