@@ -377,6 +377,9 @@ pub struct App {
     // Connection
     pub agent_rx: Option<mpsc::Receiver<AgentMessage>>,
     pub cmd_tx: Option<mpsc::Sender<OutboundCommand>>,
+    /// Messages stashed during synchronous polling (e.g. get_heap_instances).
+    /// Drained by poll_agent_messages on the next tick.
+    pub agent_pending: Vec<AgentMessage>,
 
     // Focus: 0=bytecodes, 1=locals, 2=tabbed, 3=log
     pub focus: usize,
@@ -661,6 +664,7 @@ impl App {
             state: AppState::Disconnected,
             agent_rx: None,
             cmd_tx: None,
+            agent_pending: Vec::new(),
             focus: 4,
             command_focused: true, // start with command focused
             left_tab: LeftTab::Bytecodes,
@@ -883,7 +887,7 @@ impl App {
 
     fn poll_agent_messages(&mut self) {
         // Drain all available messages into a temporary vec to avoid borrow conflict
-        let mut messages = Vec::new();
+        let mut messages: Vec<AgentMessage> = self.agent_pending.drain(..).collect();
         let mut disconnected = false;
 
         if let Some(rx) = &self.agent_rx {
@@ -897,7 +901,7 @@ impl App {
                     }
                 }
             }
-        } else {
+        } else if messages.is_empty() {
             return;
         }
 
@@ -9052,6 +9056,72 @@ impl App {
                     cmd.push_str(&format!(" {}", v));
                 }
                 self.execute_tool_as_command(&cmd)
+            }
+            "get_heap_instances" => {
+                let class = input.get("class").and_then(|v| v.as_str()).unwrap_or("");
+                if class.is_empty() {
+                    return "get_heap_instances: class is required".into();
+                }
+                let max = input.get("max").and_then(|v| v.as_i64()).unwrap_or(20)
+                    .max(1).min(50) as i32;
+
+                // Convert to JNI sig and send heap command directly
+                let jni_sig = to_jni_class(class);
+                let cmd = OutboundCommand::Heap { class: jni_sig.clone(), max: Some(max) };
+                if let Some(tx) = &self.cmd_tx {
+                    if tx.send(cmd).is_err() {
+                        return "get_heap_instances: not connected to agent".into();
+                    }
+                } else {
+                    return "get_heap_instances: not connected to agent".into();
+                }
+
+                // Poll agent_rx synchronously for up to 3s, stashing unrelated messages.
+                // Take the receiver temporarily to avoid borrow conflict with &mut self.
+                let rx = self.agent_rx.take();
+                let mut heap_result: Option<String> = None;
+
+                if let Some(ref rx) = rx {
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+                    while std::time::Instant::now() < deadline {
+                        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                        let timeout = remaining.min(std::time::Duration::from_millis(50));
+                        match rx.recv_timeout(timeout) {
+                            Ok(AgentMessage::HeapResult { class: cls, total, reported, objects }) => {
+                                let short = short_class(&cls);
+                                if reported == 0 {
+                                    heap_result = Some(format!(
+                                        "No live instances of {} found on heap (total scanned: {})",
+                                        short, total
+                                    ));
+                                } else {
+                                    let mut out = format!(
+                                        "{} instance(s) of {} (showing {}/{}):\n",
+                                        total, short, reported, total
+                                    );
+                                    for obj in &objects {
+                                        out.push_str(&format!("  [{}] {}\n", obj.index, obj.value));
+                                    }
+                                    heap_result = Some(out);
+                                }
+                                break;
+                            }
+                            Ok(other) => {
+                                // Stash unrelated messages for next tick
+                                self.agent_pending.push(other);
+                            }
+                            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                        }
+                    }
+                }
+
+                self.agent_rx = rx;
+
+                heap_result.unwrap_or_else(|| format!(
+                    "Heap search for {} timed out (app may not be connected or class not loaded)",
+                    short_class(&jni_sig)
+                ))
             }
             "get_ai_dec" => {
                 let class = input.get("class").and_then(|v| v.as_str()).unwrap_or("");

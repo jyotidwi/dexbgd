@@ -146,6 +146,19 @@ pub fn all_tools() -> Vec<ToolDef> {
             is_execution: false,
         },
         ToolDef {
+            name: "get_heap_instances",
+            description: "Find live instances of a class on the heap and show their values. Useful for reading runtime state that isn't visible from bytecodes (e.g. SharedPreferences contents, cipher keys, URL strings stored in fields). Capped at 50 instances.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "class": { "type": "string", "description": "Class to search (e.g. 'java.lang.String', 'javax.crypto.spec.SecretKeySpec')" },
+                    "max": { "type": "integer", "description": "Max instances to return (default 20, max 50)" }
+                },
+                "required": ["class"]
+            }),
+            is_execution: false,
+        },
+        ToolDef {
             name: "heapstr",
             description: "Search live String objects on the heap matching a pattern.",
             parameters: json!({
