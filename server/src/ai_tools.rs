@@ -245,6 +245,19 @@ pub fn all_tools() -> Vec<ToolDef> {
             }),
             is_execution: false,
         },
+        ToolDef {
+            name: "navigate",
+            description: "Navigate the disassembler view to a specific method (like the 'u' command). Use this when asked to navigate, jump to, or open a method in the viewer. Does not require the app to be connected or the class loaded at runtime.",
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "class": { "type": "string", "description": "Class name (e.g. 'MainActivity' or 'com.example.Foo')" },
+                    "method": { "type": "string", "description": "Method name (e.g. 'testDetect')" }
+                },
+                "required": ["class", "method"]
+            }),
+            is_execution: false,
+        },
 
         // ---------------------------------------------------------------
         // Execution tools (9)  - gated by mode

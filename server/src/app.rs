@@ -8689,6 +8689,26 @@ impl App {
 
         let prompt = prompt_parts.join(" ");
 
+        // Shortcut: "navigate to X" / "goto X" / "go to X" — no AI needed, just run u
+        {
+            let p = prompt.trim();
+            let target = if let Some(t) = p.strip_prefix("navigate to ") {
+                Some(t.trim())
+            } else if let Some(t) = p.strip_prefix("goto ") {
+                Some(t.trim())
+            } else if let Some(t) = p.strip_prefix("go to ") {
+                Some(t.trim())
+            } else {
+                None
+            };
+            if let Some(target) = target {
+                if !target.is_empty() {
+                    self.do_unassemble(target);
+                    return;
+                }
+            }
+        }
+
         // Apply overrides to a temporary config
         if let Some(backend) = backend_override {
             self.config.ai.backend = backend;
@@ -9482,6 +9502,25 @@ impl App {
                         "No AI decompilation cached for {}.{}. Run: aidec {} {}",
                         short_class(&jni_class), method, class, method
                     )
+                }
+            }
+            "navigate" => {
+                let class = input.get("class").and_then(|v| v.as_str()).unwrap_or("");
+                let method = input.get("method").and_then(|v| v.as_str()).unwrap_or("");
+                if class.is_empty() || method.is_empty() {
+                    return "navigate: provide class and method".into();
+                }
+                let arg = format!("{}.{}", class, method);
+                let log_before = self.log.len();
+                self.do_unassemble(&arg);
+                let new_entries: Vec<String> = self.log[log_before..]
+                    .iter()
+                    .map(|e| format_log_entry(e))
+                    .collect();
+                if !new_entries.is_empty() {
+                    new_entries.join("\n")
+                } else {
+                    format!("Navigated to {}.{}", class, method)
                 }
             }
             "follow_method" => {
